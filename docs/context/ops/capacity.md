@@ -26,6 +26,8 @@ sources:
   - tests/test_capacity_smoothing.py
   - src/treg/domain/capacity/fair_share.py
   - tests/test_capacity_fair_share.py
+  - src/treg/infra/provider_concurrency.py
+  - tests/test_provider_concurrency_redis.py
   - src/treg/domain/capacity/overflow_seed.json
   - src/treg/infra/upstream/aggregators/__init__.py
   - src/treg/infra/upstream/aggregators/orthogonal.py
@@ -78,7 +80,7 @@ the row is `no_api`.
 Litescrape's internal collector reads the free `GET /api/keys/status` route with the platform
 Bearer key. It accepts a nonnegative integer `remaining_calls` as the prepaid call balance and
 records the key's reported concurrency limit as an informational note. The policy is
-`requests / manual / api`; the 25 concurrent requests observed on the configured key are not
+`requests / manual / api`; the reported concurrency limit (`_CONCURRENCY`) is not
 a per-second rate, so no token-bucket rate is inferred. The status route stays out of the catalog.
 
 Fetchin capacity is `credits / manual / api`. `collectors._fetchinio` calls the free internal
@@ -462,7 +464,11 @@ pays the aggregator's real price, 0% markup, disclosed in-band when it ships (st
   account (`balance` / `quota` means exhausted, `burst` is smoothed but never exhausted, and an
   `unknown` 429 is logged).
   Lusha's "Daily" 429 and Hunter's "per billing period" 429 are quota exhaustion wearing a 429;
-  a `retry-after ≤ 60 s` is a burst. cloro says it with a **403** `error.code INSUFFICIENT_CREDITS`
+  a quota row with no wait header takes its reset from the row's `resets` (Lusha's is
+  `next_utc_midnight`), else from the sweep's account call. The wait comes from the wait
+  headers, parsed by format and never by provider (`_retry_after` in `signatures.py`); a 429 no
+  row matched is a burst when the wait is ≤ 60 s and a quota when it is longer.
+  cloro says it with a **403** `error.code INSUFFICIENT_CREDITS`
   (from its OpenAPI spec, 2026-09-07 — documented, not yet observed); its 429s are concurrency /
   rate bursts with `X-RateLimit-*` headers and the allowance resets monthly at the
   `cycleResetsAt` that `GET /v1/credits` reports. Apollo says "out of credits" with a **422** and Moz uses a
@@ -479,18 +485,21 @@ pays the aggregator's real price, 0% markup, disclosed in-band when it ships (st
   Two guards against
   the next such vendor: `unrecorded`,
   a signal kind for a 4xx no row matched whose body still names credits/quota/balance (pattern =
-  the table's own phrases plus generic nouns) - never a mark, only an `unrecorded` event and
+  generic nouns plus each row's `tripwire` phrase, so recording a vendor's wording arms it for every
+  other; a row's regex never joins by itself, since alternations like `insufficient|balance` would
+  flag a caller's own error) - never a mark, only an `unrecorded` event and
   `capacity_signal=unrecorded` on `tool_called`; and the coverage guard in
   `tests/test_capacity_overflow_routes.py`, which fails when a `platform_key_*` provider has neither
-  a table row nor an acknowledged gap. `edge_block` is the odd one out: the vendor's CDN refused the
+  a balance/quota row nor an acknowledged gap (a burst row says nothing about an empty account). `edge_block` is the odd one out: the vendor's CDN refused the
   request's shape (decided on headers, never the caller's UA), so it exhausts nothing, overflows
   nothing and alerts nothing; it exists so a chart can tell a bot-filtered UA family from a
   provider outage. Shared by the sweep, the future call-path trigger and alerts.
 - **`infra/upstream/aggregators/`** — the envelopes, and nothing else: `build()` wraps the
   vendor request (Orthogonal `POST /run {api, path, query, body}`; Monid `POST /run {provider,
   endpoint, input}`), `parse()` unwraps the vendor status + body + the real in-band charge, and
-  `build()` restores JSON scalar types that Monid validates and converts Akta enrichment's native
-  comma-separated `sections` query value to Monid's array-shaped envelope field, and
+  `build()` restores JSON scalar types that Monid validates, converts Akta enrichment's native
+  comma-separated `sections` query value to Monid's array-shaped envelope field, moves PDL's four
+  core GET enrichment/search query fields into the `input.body` Monid requires, and
   names who to blame when the aggregator itself refused (`AGGREGATOR_SIDE` = `aggregator_auth`,
   `aggregator_balance`, `malformed` - the call path marks the aggregator unhealthy for everyone, the
   verifier leaves the route alone; `contract` - the aggregator's own per-request refusal, including
@@ -616,8 +625,24 @@ after the DB phase ended and around the relay (`application/call/service.py`, pl
 The place is held until the answer is read (metered and owned-poll bodies), released in the relay
 block's `finally` on every path. A streamed free answer releases when the relay block ends, before
 the stream finishes. A wait shows in `X-Treg-Smoothed` as `share_wait=<ms>`. Own keys are never
-gated (non-negotiable 1). The counters are per process: exact for one server process; a
-multi-process deploy moves them to the shared store (`infra/kv.py`).
+gated (non-negotiable 1).
+
+The line and the fewest-first choice are per process; the cap is per account across every process.
+With `TREG_KV_URL` set every call queues, and each process asks the shared store for places on the
+account's behalf (`infra/provider_concurrency.py`: one Redis sorted set per account,
+`treg:provider-concurrency:v1:` plus the account key, on the same lease scripts as org concurrency),
+as many requests at once as it has free places and waiting calls, so free places fill in one round
+trip. Each place that lands goes to the waiting call rule 2 picks at that moment, so fewest-first
+holds for shared places too. Once the store says the account is full, the process asks one request
+at a time with backoff until a place lands; a call still waiting at
+`fair_share_wait_s` leaves as `share_busy`. A place that lands after its call left, or a reply that
+arrives after the lease could have expired, goes straight back and is never handed out. A lease
+lasts 30 s and is renewed every 10 s while the call runs, so a crashed process frees its places
+within one lease; expiry cannot stop a request already sent. When the store fails the dispatcher
+hands places out on this process's count and skips the store for 5 s; without `TREG_KV_URL` each
+process enforces the cap on its own, which is exact for one process. `share_wait` appears only for
+a call that met a full provider. Choosing an account (`keyslots`) still reads only this process's
+places.
 
 ## Overflow, the child cycle (step E) — off by default
 

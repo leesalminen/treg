@@ -17,7 +17,10 @@ serves every capability, so the capability-specific part is contract-driven maps
 Every identifier is HMAC-SHA256 under `call_events_hmac_secret`, after one normalization
 (emails lower-cased, domains without scheme or `www.`, LinkedIn URLs reduced to the handle), so
 a find's `answer_keys['email']` equals a later verify's `input_keys['email']`. No raw email,
-name, domain, phone or URL is ever emitted.
+name, domain, phone or URL is ever emitted. `answer_values` does carry raw segment text as the
+provider wrote it (at most 256 characters): a company's industry, size and HQ location, and a
+person's `location`, which can name a city. That is personal data next to the person's keys, kept
+on purpose so analysis can derive country and region later; Iceberg retention bounds it.
 
 The expensive part (reading bodies, hashing) is a builder the sink runs in its flusher; what is
 computed on the call path is a handful of attribute reads.
@@ -61,11 +64,9 @@ _ROLE_LOCALS = frozenset({
     "inquiries", "jobs", "mail", "marketing", "no-reply", "noreply", "office", "press", "sales",
     "support", "team", "webmaster",
 })
-_VALUE_MAX = 64
+_VALUE_MAX = 256
 _fingerprints: dict[int, tuple[Adapter, str]] = {}
 
-
-# ---- hashing and normalization ----------------------------------------------------------------
 
 def keyed(value: str) -> str:
     """HMAC-SHA256 of an already normalized value, 32 hex characters."""
@@ -123,8 +124,6 @@ def _stringify(value: Any) -> str | None:
     return None
 
 
-# ---- references and fingerprints --------------------------------------------------------------
-
 def ref_parts(call_ref: str | None) -> tuple[str | None, str | None, int | None]:
     """`X:r2` -> (`X`, `r2`, 2); `X:v` -> (`X`, `v`, None); a root ref -> (None, None, None)."""
     m = _STEP.match(call_ref or "")
@@ -152,8 +151,6 @@ def is_eval(org_id: int | None) -> bool:
     return org_id is not None and str(org_id) in {p.strip() for p in raw.split(",") if p.strip()}
 
 
-# ---- input and answer columns -----------------------------------------------------------------
-
 def vendor_identity(adapter: Adapter, contract: Contract, query_items: Iterable[tuple[str, str]],
                     body: bytes | None) -> dict:
     """The contract identity a vendor-shaped request expresses, read back through the adapter's
@@ -177,6 +174,13 @@ def vendor_identity(adapter: Adapter, contract: Contract, query_items: Iterable[
             v = v[0]
         if v not in (None, ""):
             given[field_name] = v
+    # An expression that is just an identity field (`body.url: linkedin_url`, used where the
+    # body is an array) reads back like a plain `in` entry; computed ones cannot be inverted.
+    for target, expr in (adapter.in_expr or {}).items():
+        if isinstance(expr, str) and expr in contract.identity_types and expr not in given:
+            v = P.get_path(doc, target)
+            if isinstance(v, (str, int)) and not isinstance(v, bool) and v != "":
+                given[expr] = v
     # A provider often takes more shapes than the adapter sends: the router sends `full_name`,
     # while a direct caller of the same finder may send `first_name` + `last_name`. A request
     # parameter named exactly like an identity field means that field; derivation then joins
@@ -254,8 +258,6 @@ def answer_columns(contract: Contract, output: dict, input_norm: dict | None = N
     return {"answer_keys": keys or None, "answer_values": values or None,
             "answer_flags": flags or None}
 
-
-# ---- emission ---------------------------------------------------------------------------------
 
 def emit(kind: str, *, org_id: int | None, endpoint_id: str | None, call_ref: str | None,
          capability: str | None = None, query_items: Iterable[tuple[str, str]] = (),

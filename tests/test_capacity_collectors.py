@@ -285,7 +285,9 @@ async def test_litescrape_capacity_uses_free_key_status():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
         row = await collectors._litescrape(client, "test")
-    assert row == {"value": 75765, "unit": "calls", "note": "key concurrency limit 25"}
+    assert row == {"value": 75765, "unit": "calls", "note": "concurrency limit 25"}
+    assert not any(word in row["note"].lower() for word in sweep._FORBIDDEN_IN_NOTE), \
+        "the sweep withholds a note that looks like a credential"
 
 
 @pytest.mark.parametrize("balance", [None, True, "100", -1])
@@ -826,7 +828,7 @@ async def test_contactout_pool_stats_are_informational_even_when_empty(contactou
         } | extra
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(
-                lambda r: httpx.Response(200, json={"status_code": 200, "usage": usage})
+                lambda r, usage=usage: httpx.Response(200, json={"status_code": 200, "usage": usage})
             )
         ) as c:
             row = await collectors.provider_balance("contactout", c)

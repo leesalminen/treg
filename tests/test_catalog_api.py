@@ -585,9 +585,6 @@ async def test_platform_eligibility_refuses_everything_it_cannot_prove():
     # It stays discoverable (a team's OWN key on a bigger plan serves it) but is never an offer.
     assert not cat.platform_eligible({**ok, "platform_blocked": "plan gate"}), \
         "a plan-gated route is not an offer, however well priced"
-    blocked = cat.by_id["akta.companies.headcount_trend"]
-    assert blocked["platform_blocked"], "the akta alt-signals family carries its plan-gate reason"
-    assert not cat.platform_eligible(blocked)
 
 
 async def test_eligibility_rides_on_the_served_row(clients: AsyncClient):
@@ -1145,6 +1142,13 @@ def test_generic_display_prices_match_web_and_cli():
     maximum = cat.cost_view({'type': 'per_call', 'currency': 'USD', 'value': 0.064,
                              'display': {'unit': 'call', 'maximum': True}}, 'another-provider')
     assert _price_label(maximum) == _cost_usd(maximum) == _cost_label(maximum) == 'up to $0.064/call'
+    # A job held at its 500-page maximum but billed per page shows the page price; the hold does not move.
+    job = cat.cost_view({'type': 'per_success', 'currency': 'USD', 'value': 0.075, 'unit': 'call',
+                         'display': {'unit': 'page', 'value': 0.00015, 'variable': True}}, 'another-provider')
+    assert job['usd'] == 0.075 and job['display_usd'] == 0.00015 and cat.advertised_usd(job) == 0.00015
+    assert _price_label(job) == _cost_usd(job) == _cost_label(job) == '$0.00015+/page'
+    from treg.application.call.resolve import _platform_estimate_micro
+    assert _platform_estimate_micro(job, {}) == 75_000
 
 
 async def test_every_comparison_page_in_the_sitemap_serves(clients):

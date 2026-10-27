@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import atexit
 import glob
+import hashlib
+import hmac
+import json
 import os
 import socket
 import tempfile
+from pathlib import Path
 
 # Tests and their CLI subprocesses must never emit production analytics.
 os.environ["TREG_TELEMETRY"] = "0"
@@ -64,6 +68,22 @@ if _test_db_url and _worker and _test_db_url.startswith("postgresql"):
 os.environ["TREG_DATABASE_URL"] = _test_db_url or _default
 # Replica tests opt in explicitly; never inherit a real replica from the shell or .env.
 os.environ["TREG_READ_DATABASE_URL"] = ""
+os.environ["TREG_WORKOS_API_KEY"] = ""
+os.environ["TREG_WORKOS_CLIENT_ID"] = ""
+os.environ["TREG_WORKOS_WEBHOOK_SECRET"] = ""
+os.environ["TREG_PUBLIC_URL"] = "https://treg.to"
+os.environ["TREG_OVERFLOW_MODE"] = "off"
+os.environ["TREG_OVERFLOW_KEY_ORTHOGONAL"] = ""
+os.environ["TREG_OVERFLOW_KEY_MONID"] = ""
+# A merged local .env can carry newly added funded platform keys that the fixed list below has not
+# learned yet. Blank their names without reading values into logs or exposing them to tests.
+_local_env = Path(__file__).resolve().parents[1] / ".env"
+_platform_names = {name for name in os.environ if name.startswith("TREG_PLATFORM_KEY_")}
+if _local_env.exists():
+    _platform_names.update(line.split("=", 1)[0].strip() for line in _local_env.read_text().splitlines()
+                           if line.startswith("TREG_PLATFORM_KEY_") and "=" in line)
+for _platform_name in _platform_names:
+    os.environ[_platform_name] = ""
 # Never let a developer's Redis URL or rollout settings turn tests into shared-store traffic.
 os.environ["TREG_KV_URL"] = ""
 os.environ["TREG_MONEY_ADMISSION_ENABLED"] = "false"
@@ -188,9 +208,25 @@ def make_upstream(hook_hits: list | None = None) -> FastAPI:
             return JSONResponse({"error": {"message": "invalid token"}}, status_code=401)
         return {"user_id": "17841400000000000", "username": "direct_ig"}
 
+    def _meta_proof_missing(request: Request) -> JSONResponse | None:
+        # treg's Meta app requires App Secret Proof: a token it issued (META-TOKEN, PAGE-TOKEN-*) is
+        # refused unless paired with HMAC-SHA256(app secret, token), as Graph does in production.
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if token != "META-TOKEN" and not token.startswith("PAGE-TOKEN"):
+            return None
+        app_secret = os.environ.get("TREG_META_CLIENT_SECRET", "").encode()
+        want = hmac.new(app_secret, token.encode(), hashlib.sha256).hexdigest()
+        if request.query_params.get("appsecret_proof") == want:
+            return None
+        return JSONResponse({"error": {
+            "message": "API calls from the server require an appsecret_proof argument",
+            "type": "GraphMethodException", "code": 100}}, status_code=400)
+
     @up.get("/me/accounts")
     @up.get("/v25.0/me/accounts")
-    async def meta_pages(request: Request) -> dict:
+    async def meta_pages(request: Request):
+        if refused := _meta_proof_missing(request):
+            return refused
         # Meta's primary Page listing: what the user manages through a PERSONAL Page role. One row
         # carries both the facebook shape (id/name) and the instagram shape (nested professional
         # account), so both Meta providers can discover against the same stand-in.
@@ -205,6 +241,8 @@ def make_upstream(hook_hits: list | None = None) -> FastAPI:
     @up.get("/me/businesses")
     @up.get("/v25.0/me/businesses")
     async def meta_businesses(request: Request):
+        if refused := _meta_proof_missing(request):
+            return refused
         # Meta's Business walk (needs business_management): each business row nests owned_pages /
         # client_pages whose entries are shaped like /me/accounts rows. PAGE-DIRECT reappears here
         # (a personal-role Page is usually also Business-owned) to exercise dedup, and the
@@ -239,6 +277,8 @@ def make_upstream(hook_hits: list | None = None) -> FastAPI:
 
     @up.get("/v25.0/{page_id}/conversations")
     async def instagram_conversations(page_id: str, request: Request):
+        if refused := _meta_proof_missing(request):
+            return refused
         if request.headers.get("authorization") == "Bearer IG-LONG-TOKEN":
             return {
                 "auth": request.headers["authorization"],
@@ -258,6 +298,8 @@ def make_upstream(hook_hits: list | None = None) -> FastAPI:
 
     @up.get("/v25.0/{page_id}/posts")
     async def facebook_page_posts(page_id: str, request: Request):
+        if refused := _meta_proof_missing(request):
+            return refused
         # Meta's new Pages experience answers a user token on a Page edge with code 190 /
         # subcode 2069032. Only the token of the Page in the path is accepted.
         expected_token = {
@@ -274,6 +316,8 @@ def make_upstream(hook_hits: list | None = None) -> FastAPI:
 
     @up.post("/v25.0/{page_id}/subscribed_apps")
     async def instagram_subscribe(page_id: str, request: Request):
+        if refused := _meta_proof_missing(request):
+            return refused
         expected_token = {
             "PAGE-DIRECT": "PAGE-TOKEN-DIRECT",
             "PAGE-CLIENT": "PAGE-TOKEN-CLIENT",
@@ -435,6 +479,23 @@ async def funded_user(client, email, *, micro=1_000_000):
         await money.grant(db, body["org_id"], amount_micro=micro, kind="promotional")
         await db.commit()
     return body
+
+
+def mcp_text_result(name: str, payload: dict) -> dict:
+    """The text block a host shows, after checking that `structuredContent` (what a host may read
+    instead) carries every key it does: the output schema silently drops an undeclared one."""
+    result = payload.get("result") or {}
+    content = result.get("content") or []
+    if not (content and content[0].get("type") == "text"):
+        return payload
+    try:
+        text = json.loads(content[0]["text"])
+    except ValueError:
+        return {"_text": content[0]["text"]}
+    if isinstance(text, dict) and isinstance(result.get("structuredContent"), dict):
+        dropped = {k for k, v in text.items() if v is not None} - set(result["structuredContent"])
+        assert not dropped, f"{name}: structuredContent drops {sorted(dropped)}"
+    return text
 
 
 async def drain_background_writes():

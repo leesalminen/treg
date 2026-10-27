@@ -38,6 +38,8 @@ GLOBAL_CONCURRENCY = 8
 PROVIDER_CONCURRENCY = 2
 POLL_TIMEOUT_S = 10
 PROCESS_TIMEOUT_S = 30
+# Of a row's PROCESS_TIMEOUT_S, the time admission leaves for the settlement session itself.
+SETTLEMENT_SESSION_S = 10
 CLAIM_LEASE_S = 60
 # Terminal task JSON is small; a provider that streams more than this is not answering a poll.
 MAX_POLL_BODY_BYTES = 2 * 1024 * 1024
@@ -309,8 +311,7 @@ async def _poll(row: AsyncTaskRecord, client: httpx.AsyncClient) -> tuple[int, b
     method, url, query = _poll_target(row)
     # The query travels as `query_items`: the relay composes the upstream URL from those (it
     # forwards a URL's own query string nowhere), so a query-parameter poll (MiniMax v1
-    # `?task_id=`) appended to the URL reached the provider empty - "invalid params" until the
-    # 24-hour deadline. Path-parameter polls never showed it. Live 2026-09-02.
+    # `?task_id=`) appended to the URL would reach the provider empty.
     # The task exists only on the account that accepted it (`keyslots`); a retired account
     # raises here and the row fails like any other unreachable poll.
     account = keyslots.pinned(row.provider, owners=(row.key_slot,))
@@ -446,10 +447,14 @@ async def _finish(call_id: str, outcome: str, document: object | None, now, *,
 
 
 async def _finish_balance(org_id: int | None, operation: str, call_id: str, outcome: str,
-                          document: object | None, now, **kwargs) -> str:
-    """Admit one balance-row finish, then open its session. Not used around a second admit."""
+                          document: object | None, now, *, deadline: float | None = None,
+                          **kwargs) -> str:
+    """Admit one balance-row finish, then open its session. Not used around a second admit.
+    `deadline` is the worker row's loop-time deadline; admission keeps the session's share of it."""
     orgs = money_admission.require_balance_orgs([org_id])
-    async with money_admission.admit(orgs, operation=operation):
+    max_wait_s = (None if deadline is None else
+                  deadline - asyncio.get_running_loop().time() - SETTLEMENT_SESSION_S)
+    async with money_admission.admit(orgs, operation=operation, max_wait_s=max_wait_s):
         return await _finish(call_id, outcome, document, now, **kwargs)
 
 
@@ -481,7 +486,7 @@ async def _answers_allowed(db, org_id: int | None) -> bool:
         return False
     try:
         org = await db.get(Org, org_id)
-    except Exception:  # noqa: BLE001 - an optional event column never stops a settle or release
+    except Exception:
         log.warning("could not read the archive opt-out of org %s; event sent without answers",
                     org_id, exc_info=True)
         return False
@@ -491,7 +496,7 @@ async def _answers_allowed(db, org_id: int | None) -> bool:
 async def _finish_terminal(snapshot: AsyncTaskRecord, outcome: str, document: object,
                            status_code: int, body: bytes, now, *, require_usage: bool = False,
                            expected_attempt: int | None = None,
-                           answers_allowed: bool = False) -> str:
+                           answers_allowed: bool = False, deadline: float | None = None) -> str:
     """One settlement and evidence path for caller polling and the recovery worker."""
     # A confirmed terminal failure produced no contact for this attempt. Count it in
     # routing's P(hit); pending and timed-out jobs still have no known verdict.
@@ -518,10 +523,12 @@ async def _finish_terminal(snapshot: AsyncTaskRecord, outcome: str, document: ob
         result = await _finish(snapshot.call_id, outcome, document, now, **finish_args)
     elif outcome in ("success", "billed_failure") and not expired:
         result = await _finish_balance(
-            snapshot.org_id, "async", snapshot.call_id, outcome, document, now, **finish_args)
+            snapshot.org_id, "async", snapshot.call_id, outcome, document, now, deadline=deadline,
+            **finish_args)
     else:
         result = await _finish_balance(
-            snapshot.org_id, "release", snapshot.call_id, outcome, document, now, **finish_args)
+            snapshot.org_id, "release", snapshot.call_id, outcome, document, now, deadline=deadline,
+            **finish_args)
     expected = asynctasks.SETTLED if outcome in ("success", "billed_failure") else asynctasks.RELEASED
     _terminal_event(snapshot, result, outcome if result == expected else result,
                     status_code=status_code, body=body,
@@ -538,12 +545,13 @@ async def _finish_terminal(snapshot: AsyncTaskRecord, outcome: str, document: ob
         try:
             await archive.store_terminal_response(
                 snapshot.call_id, snapshot.provider, snapshot.endpoint_id, status_code, body)
-        except Exception:  # noqa: BLE001 - archive is best effort, settlement is durable
+        except Exception:
             log.exception("could not archive terminal evidence for %s", snapshot.call_id)
     return result
 
 
-async def _process(call_id: str, client: httpx.AsyncClient, attempt: int) -> str:
+async def _process(call_id: str, client: httpx.AsyncClient, attempt: int, *,
+                   deadline: float | None = None) -> str:
     now = utcnow_naive()
     async with session_maker() as db:
         row = await db.get(AsyncTaskRecord, call_id)
@@ -558,7 +566,7 @@ async def _process(call_id: str, client: httpx.AsyncClient, attempt: int) -> str
         settled: dict = {}
         result = await _finish_balance(
             snapshot.org_id, "release", call_id, "timed_out", None, now, expected_attempt=attempt,
-            settled=settled)
+            settled=settled, deadline=deadline)
         _terminal_event(snapshot, result, "timed_out", charged_micro=settled.get("micro"))
         return result
     try:
@@ -574,7 +582,8 @@ async def _process(call_id: str, client: httpx.AsyncClient, attempt: int) -> str
         outcome = asynctasks.classify_terminal(snapshot.descriptor, document)
         if outcome in ("success", "failure", "billed_failure"):
             return await _finish_terminal(snapshot, outcome, document, status, body, utcnow_naive(),
-                                          expected_attempt=attempt, answers_allowed=answers_allowed)
+                                          expected_attempt=attempt, answers_allowed=answers_allowed,
+                                          deadline=deadline)
         return await _finish(call_id, outcome, document, utcnow_naive(), expected_attempt=attempt)
     except money_admission.AdmissionRefused:
         raise
@@ -593,12 +602,12 @@ async def _process(call_id: str, client: httpx.AsyncClient, attempt: int) -> str
         settled: dict = {}
         result = await _finish_balance(snapshot.org_id, "release", call_id, "account_retired",
                                        None, utcnow_naive(), expected_attempt=attempt,
-                                       settled=settled)
+                                       settled=settled, deadline=deadline)
         _terminal_event(snapshot, result, "account_retired", charged_micro=settled.get("micro"))
         return result
     except money_admission.AdmissionRefused:
         raise
-    except Exception:  # noqa: BLE001 - the row stays pending; the next tick or the deadline ends it
+    except Exception:
         log.exception("could not release async task %s on a retired account", call_id)
         return "backed_off"
 
@@ -610,10 +619,9 @@ async def settle_due(*, limit: int = DEFAULT_LIMIT, client: httpx.AsyncClient | 
     if not candidates:
         return TickResult()
     # Load the catalog before any poll starts, in a thread: `_poll_target` reads it, and the first
-    # read in a fresh worker process parses every provider file. Inside a poll that parse froze the
-    # event loop past POLL_TIMEOUT_S, so polls already in flight timed out without the provider
-    # being slow. After this the polls read the cached catalog and their timeout measures the
-    # provider alone.
+    # read in a fresh worker process parses every provider file. Inside a poll that parse would
+    # block the event loop past POLL_TIMEOUT_S; after this the polls read the cached catalog and
+    # their timeout measures the provider alone.
     await asyncio.to_thread(catalog_store.load)
     global_sem = asyncio.Semaphore(GLOBAL_CONCURRENCY)
     provider_sems: dict[str, asyncio.Semaphore] = {}
@@ -627,12 +635,12 @@ async def settle_due(*, limit: int = DEFAULT_LIMIT, client: httpx.AsyncClient | 
         async with sem, global_sem:
             attempt = None
             try:
-                async with asyncio.timeout(PROCESS_TIMEOUT_S):
+                async with asyncio.timeout(PROCESS_TIMEOUT_S) as scope:
                     attempt = await _claim_due(call_id, utcnow_naive())
                     if attempt is None:
                         return "noop"
                     claimed += 1
-                    return await _process(call_id, client, attempt)
+                    return await _process(call_id, client, attempt, deadline=scope.when())
             except TimeoutError:
                 if attempt is None:
                     return "backed_off"

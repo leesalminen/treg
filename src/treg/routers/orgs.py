@@ -5,7 +5,7 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
@@ -15,7 +15,8 @@ from sqlmodel import select
 from .. import analytics, crypto, email as email_sender, health, localrun
 from .. import oauth_providers
 from .. import providers as _providers
-from ..application import key_spend
+from ..application import call_usage, key_spend
+from ..application import enterprise_sso
 from ..application import images
 from ..application.onboard import demo as demo_seed
 from ..application import archive_erasure
@@ -48,13 +49,14 @@ from ..domain.identity.access import (
 )
 from ..domain.identity import api_keys as managed_keys
 from ..domain.identity import session as identity_session
-from ..infra.db import get_session
+from ..infra.db import get_report_session, get_session
 from ..models import (
     ROLE_RANK,
     ApiKey,
     Bundle,
     CallRecord,
     DenyRule,
+    EnterpriseSSO,
     Invite,
     Membership,
     Org,
@@ -67,19 +69,18 @@ from ..models import (
 )
 from ..timeutil import as_naive as _as_naive
 from ..timeutil import utcnow_naive as _utcnow_naive
+from .auth_helpers import _is_https, require_managed_cli
+from .signup_cookies import REFERRAL_COOKIE
 
 
 _day_start_utc = usage_policy._day_start_utc
 count_today = usage_policy.count_today
 _deny_match = access_policy._deny_match
 _org_deny_rules = access_policy._org_deny_rules
-from .auth_helpers import _is_https, require_managed_cli
-from .signup_cookies import REFERRAL_COOKIE
 
 
 INVITE_TTL_DAYS = 7  # invite codes are one-time AND expire after this many days
 
-# list_cli_deny keeps its original lazy relative import after moving one package level deeper.
 sys.modules.setdefault("treg.routers.providers", _providers)
 
 
@@ -233,14 +234,16 @@ async def _enforce_deny(
         raise HTTPException(status_code=403, detail=exc.detail) from exc
 
 
-async def _usage_rollup(db: AsyncSession, org_id: int, since: datetime) -> dict:
+async def _usage_rollup(db: AsyncSession, org_id: int, since: datetime,
+                        folded: list[call_usage.UsageRow] | None) -> dict:
     """Aggregate usage since `since` into by-user (with a per-kind split), by-tool, by-day, and totals.
     CallRecord carries `kind` ("call"/"local_run"); every RunRecord is a "server_run". Pure GROUP BY —
     no request/response bodies are read (we don't store them). See docs/USAGE-METERING-PLAN.md.
 
-    ONE pass over the window's call rows answers by-user, by-kind and by-tool together: they read the
-    same rows, and separate GROUP BYs read them once each. The per-day count is the second pass, and
-    the cheap one: it needs only `(org_id, created_at)`, which its index already holds."""
+    The call side comes from `folded`, the daily rollup's rows (`application/call_usage.py`). Only
+    when the rollup worker has never run is it None, and the audit table is aggregated here: ONE
+    pass answers by-user, by-kind and by-tool together, and the per-day count is a second pass over
+    `(org_id, created_at)`."""
     KINDS = ("call", "local_run", "server_run")
     totals = {k: 0 for k in KINDS}
     users: dict[str, dict] = {}
@@ -252,10 +255,21 @@ async def _usage_rollup(db: AsyncSession, org_id: int, since: datetime) -> dict:
         totals[kind] += n
         tools[tool] = tools.get(tool, 0) + n
 
-    for email, kind, tool, n in (await db.execute(
+    days: dict[str, int] = {}  # func.date() → 'YYYY-MM-DD' on sqlite, a date on Postgres; str() both
+    if folded is None:
+        call_rows = (await db.execute(
             select(CallRecord.user_email, CallRecord.kind, CallRecord.tool_name, func.count()).where(
                 CallRecord.org_id == org_id, CallRecord.created_at >= since
-            ).group_by(CallRecord.user_email, CallRecord.kind, CallRecord.tool_name))).all():
+            ).group_by(CallRecord.user_email, CallRecord.kind, CallRecord.tool_name))).all()
+        for d, n in (await db.execute(select(func.date(CallRecord.created_at), func.count()).where(
+                CallRecord.org_id == org_id, CallRecord.created_at >= since
+        ).group_by(func.date(CallRecord.created_at)))).all():
+            days[str(d)] = days.get(str(d), 0) + n
+    else:
+        call_rows = [(email, kind, tool, n) for _, email, kind, tool, _, n, _ in folded]
+        for d, *_, n, _ in folded:
+            days[d] = days.get(d, 0) + n
+    for email, kind, tool, n in call_rows:
         _bump(email, kind if kind in KINDS else "call", tool, n)  # guard an unexpected kind into "call"
     for email, tool, n in (await db.execute(
             select(RunRecord.user_email, RunRecord.bundle_name, func.count()).where(
@@ -269,11 +283,10 @@ async def _usage_rollup(db: AsyncSession, org_id: int, since: datetime) -> dict:
     totals["total"] = sum(totals[k] for k in KINDS)
     by_tool = sorted(({"name": k, "total": v} for k, v in tools.items()), key=lambda r: (-r["total"], r["name"]))
 
-    days: dict[str, int] = {}  # func.date() → 'YYYY-MM-DD' on sqlite, a date on Postgres; str() both
-    for tbl in (CallRecord, RunRecord):
-        for d, n in (await db.execute(select(func.date(tbl.created_at), func.count()).where(
-                tbl.org_id == org_id, tbl.created_at >= since).group_by(func.date(tbl.created_at)))).all():
-            days[str(d)] = days.get(str(d), 0) + n
+    for d, n in (await db.execute(select(func.date(RunRecord.created_at), func.count()).where(
+            RunRecord.org_id == org_id, RunRecord.created_at >= since
+    ).group_by(func.date(RunRecord.created_at)))).all():
+        days[str(d)] = days.get(str(d), 0) + n
     by_day = sorted(({"day": k, "total": v} for k, v in days.items()), key=lambda r: r["day"])
 
     # What those calls COST the team on treg's own keys — read from the ledger (the authority on money)
@@ -289,7 +302,7 @@ class OrgPatchIn(BaseModel):
 
 class OrgSettingsIn(BaseModel):
     daily_cap_micro: int | None = None
-    platform_overflow: bool | None = None  # False = opt out of the overflow relay (ops/capacity.md)
+    platform_overflow: bool | None = None  # False = opt out of the overflow relay
     archive: bool | None = None  # False = opt out of the archive (archive.md, "Opting out")
     budget_dims: list[str] | None = None
     primary_dim: str | None = None
@@ -384,7 +397,6 @@ def _signup_http_error(exc: signup_use_cases.SignupError) -> HTTPException:
     return HTTPException(status_code=status_code, detail=detail)
 
 
-# The app alias preserves the handlers' @app decorators and the ordered attachment convention.
 app = APIRouter()
 signup_router = app
 
@@ -411,7 +423,11 @@ async def register_user(body: UserIn, request: Request, response: Response) -> d
 async def create_org(
     body: OrgIn, request: Request, response: Response,
     user: User = Depends(require_identity),
+    treg_session: str = Cookie(default=""),
+    x_treg_token: str = Header(default=""),
 ) -> dict:
+    if not x_treg_token and (identity_session.read_session_claims(treg_session) or {}).get("sso_org_id") is not None:
+        raise HTTPException(403, "sign in normally to create another team")
     require_managed_cli(request, team_change=True)
     try:
         result = await signup_use_cases.create_org(
@@ -438,6 +454,7 @@ async def list_orgs(
     user: User = Depends(require_identity),
     x_treg_token: str = Header(default=""),
     x_treg_org: str = Header(default=""),
+    treg_session: str = Cookie(default=""),
     db: AsyncSession = Depends(get_session),
 ) -> list[dict]:
     orgs = await teams.list_user_orgs(
@@ -446,6 +463,10 @@ async def list_orgs(
         x_treg_org=x_treg_org,
         db=db,
     )
+    sso_org_id = ((identity_session.read_identity_claims(x_treg_token) or {}).get("sso_org_id")
+                  if x_treg_token else (identity_session.read_session_claims(treg_session) or {}).get("sso_org_id"))
+    if sso_org_id is not None:
+        orgs = [org for org in orgs if org["org_id"] == sso_org_id]
     for o in orgs:  # the team's picture as a URL (None = initials); the key stays internal
         o["avatar_url"] = images.public_url(o.pop("avatar_key", None))
     return orgs
@@ -476,8 +497,7 @@ async def create_invite(
         ))).scalar_one_or_none()
         if m is not None:
             raise HTTPException(status_code=409, detail="that email is already a member of this org")
-    # Supersede any prior pending invite for this email so there's exactly one live code per invitee
-    # (re-inviting used to stack duplicate pending rows that all point at the same seat).
+    # Supersede any prior pending invite for this email so there's exactly one live code per invitee.
     for prior in (await db.execute(select(Invite).where(
         Invite.org_id == org_id, Invite.email == email, Invite.status == "pending"
     ))).scalars().all():
@@ -572,9 +592,9 @@ async def accept_invite(
     invite.status = "accepted"
     try:
         await db.commit()  # a concurrent double-accept trips uq_membership_user_org — 409, not 500
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="already a member of this org")
+        raise HTTPException(status_code=409, detail="already a member of this org") from exc
     org = await db.get(Org, invite.org_id)
     response.headers["Cache-Control"] = "no-store"
     return {"org": org.slug, "org_id": org.id, "name": org.name, "role": invite.role, "token": token}
@@ -591,7 +611,7 @@ async def my_invites(
                          .order_by(Invite.created_at.desc(), Invite.id.desc()))  # stable newest-first order
     ).scalars().all()
     now = _utcnow_naive()
-    orgs = {  # batch the org lookup (was one db.get per invite)
+    orgs = {  # batch the org lookup, not one db.get per invite
         o.id: o for o in (await db.execute(
             select(Org).where(Org.id.in_([inv.org_id for inv in rows]))
         )).scalars().all()
@@ -676,9 +696,9 @@ async def accept_my_invite(
     invite.status = "accepted"
     try:
         await db.commit()  # a concurrent double-accept trips uq_membership_user_org — 409, not 500
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="already a member of this org")
+        raise HTTPException(status_code=409, detail="already a member of this org") from exc
     org = await db.get(Org, invite.org_id)
     response.headers["Cache-Control"] = "no-store"
     return {"org": org.slug, "org_id": org.id, "name": org.name, "role": invite.role, "token": token}
@@ -727,7 +747,7 @@ async def list_members(
 ) -> list[dict]:
     _require_admin_of(org_id, caller)
     memberships = (await db.execute(select(Membership).where(Membership.org_id == org_id))).scalars().all()
-    users = {  # batch the user lookup (was one db.get per member)
+    users = {  # batch the user lookup, not one db.get per member
         u.id: u for u in (await db.execute(
             select(User).where(User.id.in_([m.user_id for m in memberships]))
         )).scalars().all()
@@ -833,6 +853,7 @@ async def remove_member(
         raise HTTPException(status_code=404, detail="not a member of this org")
     if membership.role == "owner":  # only an owner manages owners; an admin cannot remove one
         raise HTTPException(status_code=403, detail="owners cannot be removed")
+    await enterprise_sso.block_removed_member(db, org_id, user_id, caller.user.id)
     await teams.delete_membership(db, membership, actor_email=caller.email)
     await db.commit()
     return {"removed": user_id}
@@ -866,6 +887,8 @@ async def set_member_role(
             raise _owned_team_limit_error() from exc
     if membership.role == "owner" and body.role != "owner" and await _count_owners(org_id, db) <= 1:
         raise HTTPException(status_code=409, detail="cannot demote the last owner — promote another owner first")
+    await enterprise_sso.record_role_change(db, org_id, actor=caller.user.id,
+        subject=user_id, from_role=membership.role, to_role=body.role)
     membership.role = body.role
     await db.commit()
     return {"user_id": user_id, "role": body.role, "org_id": org_id}
@@ -903,6 +926,12 @@ async def delete_org(
     if confirm != org.slug:
         raise HTTPException(status_code=422, detail=(
             f"to delete this team, confirm with its slug: ?confirm={org.slug}"))
+    from ..models import EnterpriseSSO
+    sso = await db.get(EnterpriseSSO, org_id)
+    if sso is not None and sso.stripe_subscription_id and sso.subscription_status not in {"canceled", "incomplete_expired"}:
+        raise HTTPException(status_code=409, detail="cancel the SSO subscription in Billing before deleting this team")
+    if sso is not None and sso.workos_org_id and sso.workos_cleanup_completed_at is None:
+        raise HTTPException(status_code=409, detail="wait for SSO setup cleanup before deleting this team")
     # The team's archived answers go with it (archive.md, "Opting out"). The opt-out is set and
     # committed first, so nothing new of the team's is recorded from here on; the object phase
     # then runs on its own short sessions after this one has let go of its connection, and a
@@ -916,10 +945,10 @@ async def delete_org(
     return {"deleted_org": org_id}
 
 
-# ---- machine identities: the publishable demo token, and agents ----------------------------
-# Both are Users on an UNROUTABLE domain, which is what makes them machines rather than people: no
-# login door can ever resolve one (guarded in `_find_or_create_user`) and neither may act as a USER
-# (guarded in `require_identity`). Everything else they inherit from Membership for free.
+# Machine identities (the publishable demo token, and agents) are both Users on an UNROUTABLE
+# domain, which is what makes them machines rather than people: no login door can ever resolve one
+# (guarded in `_find_or_create_user`) and neither may act as a USER (guarded in `require_identity`).
+# Everything else they inherit from Membership for free.
 # NOTE: "agent" here is an IDENTITY — a coding agent / automation that calls treg. It is NOT the
 # skill-directory table in `agents.py` (which answers "where does each coding agent keep its skills").
 # The words collide, the concepts don't; kept apart deliberately.
@@ -1010,7 +1039,6 @@ async def delete_public_token(
     return {"public_token_revoked": True, "org": org.slug}
 
 
-# ---- agents: a member identity for a machine caller ----------------------------------------
 # An agent is JUST a Membership whose user lives on AGENT_DOMAIN, which is why this needs no new
 # table and no migration: it inherits every per-member control already in place — `daily_call_cap`
 # (enforced by `_enforce_daily_cap`), `tool_access` (`_require_tool_access`, on the proxy AND both run
@@ -1102,14 +1130,16 @@ async def create_agent(
         # rows without ever passing the parser.
         pins = dict(_validate_tag_pair(k, v) for k, v in pins.items())
     membership.pinned_tags = pins or None
+    enterprise = await db.get(EnterpriseSSO, org_id)
     try:
         token, key = await managed_keys.rotate_agent_key(
             db, membership, user, actor_email=caller.email,
+            sso_org_id=org_id if enterprise is not None and enterprise.enforced else None,
         )
         await db.commit()
-    except (managed_keys.RotationConflict, IntegrityError):
+    except (managed_keys.RotationConflict, IntegrityError) as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="another rotation already replaced this agent key")
+        raise HTTPException(status_code=409, detail="another rotation already replaced this agent key") from exc
     response.headers["Cache-Control"] = "no-store"
     return {"token": token, "name": name, "email": email, "org": caller.org.slug, "user_id": user.id,
             "api_key_id": key.id,
@@ -1134,9 +1164,11 @@ async def list_agents(
     agent_emails = [u.email for u in users.values() if _is_agent_email(u.email)]
     # The roster shows lifetime identity history. The setup card polls the separate connection
     # endpoint for its newly issued key, so a rotation cannot inherit an old key's check-in.
+    # One EXISTS per agent: a DISTINCT over (org_id, user_email) reads every call each agent ever
+    # made, because Postgres before 18 cannot skip-scan to the next email.
     seen = set((await db.execute(
-        select(CallRecord.user_email).where(
-            CallRecord.org_id == org_id, CallRecord.user_email.in_(agent_emails)).distinct()
+        select(User.email).where(User.email.in_(agent_emails), select(CallRecord.id).where(
+            CallRecord.org_id == org_id, CallRecord.user_email == User.email).exists())
     )).scalars().all()) if agent_emails else set()
     out: list[dict] = []
     for m in memberships:
@@ -1202,7 +1234,7 @@ async def agent_checkin(
 
 @app.get("/orgs/{org_id}/agents/observed")
 async def list_observed_agents(
-    org_id: int, caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_session)
+    org_id: int, caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_report_session)
 ) -> list[dict]:
     """The agents ALREADY running under members' own tokens, discovered from traffic: one row per
     (member, runtime) seen in the last 30 days, e.g. "sam@… / claude-code". The zero-setup half
@@ -1212,6 +1244,10 @@ async def list_observed_agents(
 
     Machine identities are excluded — their calls are already attributed to themselves. So is a
     plain terminal (`client` in ('', 'cli')): a roster that lists every human twice teaches nothing.
+
+    Calls come from the daily usage rollup (`application/call_usage.py`), so the window starts at a
+    UTC midnight; the roster is empty while the rollup's first backfill runs, and reads the audit
+    table itself only where the rollup worker has never run.
     """
     _require_admin_of(org_id, caller)
     now = _utcnow_naive()
@@ -1222,11 +1258,26 @@ async def list_observed_agents(
     promoted = {tuple(m.promoted_from.split("|", 1)) for m in (await db.execute(
         select(Membership).where(Membership.org_id == org_id,
                                  Membership.promoted_from != ""))).scalars().all()}
-    rows: dict[tuple[str, str], dict] = {}
-    for model, email_col, when_col, client_col in (
-        (CallRecord, CallRecord.user_email, CallRecord.created_at, CallRecord.client),
-        (RunRecord, RunRecord.user_email, RunRecord.created_at, RunRecord.client),
-    ):
+    tables = [(RunRecord, RunRecord.user_email, RunRecord.created_at, RunRecord.client)]
+    seen: list[tuple] = []
+    state = await call_usage.cursor(db)
+    if state is None:   # the usage rollup worker never ran: read the audit table itself
+        tables.append((CallRecord, CallRecord.user_email, CallRecord.created_at, CallRecord.client))
+    elif state.caught_up_at is None:
+        return []           # the rollup's first backfill is still running
+    else:
+        since = max(since.replace(hour=0, minute=0, second=0, microsecond=0),
+                    datetime.fromisoformat(state.history_from))
+        folded: dict[tuple[str, str], list] = {}
+        for day, email, _, _, client, n, last_at in await call_usage.rows(db, org_id, since):
+            if client in ("", "cli"):
+                continue
+            cur = folded.setdefault((email, client), [0, last_at, 0])
+            cur[0] += n
+            cur[1] = max(cur[1], last_at)
+            cur[2] += n if day == today.strftime("%Y-%m-%d") else 0
+        seen += [(email, client, *v) for (email, client), v in folded.items()]
+    for model, email_col, when_col, client_col in tables:
         # One grouped pass per table: the 30-day totals plus today's slice as a conditional sum,
         # so a second identical GROUP BY isn't needed just to get `used_today`.
         q = (select(email_col, client_col, func.count(), func.max(when_col),
@@ -1234,15 +1285,17 @@ async def list_observed_agents(
              .where(model.org_id == org_id, when_col >= since,
                     client_col.not_in(("", "cli")))
              .group_by(email_col, client_col))
-        for email, client, count, last_seen, today_count in (await db.execute(q)).all():
-            if _is_machine_email(email) or (email, client) in promoted:
-                continue
-            cur = rows.setdefault((email, client), {"member": email, "client": client,
-                                                    "calls_30d": 0, "used_today": 0,
-                                                    "last_seen": last_seen})
-            cur["calls_30d"] += count
-            cur["used_today"] += today_count
-            cur["last_seen"] = max(cur["last_seen"], last_seen)
+        seen += (await db.execute(q)).all()
+    rows: dict[tuple[str, str], dict] = {}
+    for email, client, count, last_seen, today_count in seen:
+        if _is_machine_email(email) or (email, client) in promoted:
+            continue
+        cur = rows.setdefault((email, client), {"member": email, "client": client,
+                                                "calls_30d": 0, "used_today": 0,
+                                                "last_seen": last_seen})
+        cur["calls_30d"] += count
+        cur["used_today"] += today_count
+        cur["last_seen"] = max(cur["last_seen"], last_seen)
     return sorted(rows.values(), key=lambda r: (r["member"], r["client"]))
 
 
@@ -1278,7 +1331,7 @@ org_usage_router = app
 @app.get("/orgs/{org_id}/usage")
 async def org_usage(
     org_id: int, days: int = 30,
-    caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_session),
+    caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_report_session),
 ) -> dict:
     """Usage rollups for an org over the last `days` (admin/owner): by user (with a call/local/server
     split), by tool, by day, and totals — counts only, no request/response bodies. Powers the dashboard
@@ -1286,7 +1339,16 @@ async def org_usage(
     _require_admin_of(org_id, caller)
     days = max(1, min(days, 365))
     since = _day_start_utc() - timedelta(days=days - 1)  # inclusive of today + the prior days-1
-    return {"days": days, "since": since.isoformat(), **await _usage_rollup(db, org_id, since)}
+    out = {"days": days, "since": since.isoformat()}
+    state = await call_usage.cursor(db)
+    if state is None:
+        return {**out, "ready": True, **await _usage_rollup(db, org_id, since, None)}
+    out["history_from"] = state.history_from
+    if state.caught_up_at is None:
+        return {**out, "ready": False}
+    since = max(since, datetime.fromisoformat(state.history_from))
+    folded = await call_usage.rows(db, org_id, since)
+    return {**out, "ready": True, **await _usage_rollup(db, org_id, since, folded)}
 
 
 @app.get("/orgs/{org_id}/usage/spend")
@@ -1312,8 +1374,8 @@ async def usage_spend(
     try:
         last = min(date.fromisoformat(to) if to else today, today)
         first = date.fromisoformat(from_) if from_ else key_spend.first_day(last, key_spend.WINDOW_DAYS)
-    except ValueError:
-        raise HTTPException(status_code=422, detail="from and to are dates: YYYY-MM-DD")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="from and to are dates: YYYY-MM-DD") from exc
     if first > last:
         raise HTTPException(status_code=422, detail="from must not be after to")
     state = await key_spend.history(db)
@@ -1356,7 +1418,7 @@ async def list_tag_keys(
 @app.get("/orgs/{org_id}/usage/by-tag")
 async def usage_by_tag(
     org_id: int, key: str | None = None, days: int = 30,
-    caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_session),
+    caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_report_session),
 ) -> dict:
     """What each value of one tag consumed — the numbers a reselling builder invoices from.
 
@@ -1376,9 +1438,7 @@ async def usage_by_tag(
 
     by_value = await ledger.spend_by_tag(db, org_id, dim, since)
     org_total = (await ledger.spend_since(db, org_id, since))["spend_micro"]
-    # Counts come from the tag rows too. `CallRecord` holds only the primary dimension, so counting
-    # there reported 0 for every non-primary key while the money column was correct — a report that
-    # disagrees with itself is worse than one that admits its grain.
+    # Counts come from the tag rows too: `CallRecord` holds only the primary dimension.
     counts = await ledger.calls_by_tag(db, org_id, dim, since)
     rows = [{"value": val, "charged_micro": micro, "charged_usd": ledger.usd(micro),
              "calls": int(counts.get(val, 0))}
@@ -1416,10 +1476,10 @@ async def rename_org(
                                allow_reserved=bool(caller.user.is_superadmin))
         await db.commit()
     except ValueError as e:
-        raise HTTPException(status_code=409 if "taken" in str(e) else 400, detail=str(e))
-    except IntegrityError:
+        raise HTTPException(status_code=409 if "taken" in str(e) else 400, detail=str(e)) from e
+    except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="slug is taken")
+        raise HTTPException(status_code=409, detail="slug is taken") from exc
     analytics.capture(caller.email, "org_renamed", {
         "org_id": org.id, "slug_changed": org.slug != old_slug})
     return {"org_id": org.id, "org": org.slug, "previous_slug": org.previous_slug, "name": org.name}
@@ -1541,9 +1601,8 @@ async def set_tag_budget(
         _validate_tag_pair(dim, val)  # same rule as the call path — this value becomes a storage key
     declared = _budget_dims_of(caller.org)
     if dim not in declared:
-        # Setting a limit IS the declaration. Requiring a separate PATCH first made the common path a
-        # hidden two-step: the tag shows up in usage reports, so a person reasonably expects to be
-        # able to cap it, and got a 422 telling them to go configure something else first.
+        # Setting a limit IS the declaration: the tag shows up in usage reports, so a person
+        # reasonably expects to be able to cap it without configuring something else first.
         #
         # The BOUND still holds, because it is what keeps the call path cheap — each declared
         # dimension is another indexed lookup on every proxied call and another row per value. Past

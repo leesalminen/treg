@@ -24,7 +24,6 @@ from starlette.routing import BaseRoute, Mount
 from . import adsconv, analytics, archive, audit, call_events
 from .application.call import route as routed_call
 from .application import arena, find_index
-from .application.onboard import first_run
 from . import bootstrap_handlers, policy
 from .bootstrap_http import (
     _BodyDecodeMiddleware,
@@ -35,7 +34,7 @@ from .bootstrap_http import (
 from .config import TREG_USER_AGENT, get_settings
 from .infra import kv, money_timing, org_traffic, turnstile
 from .infra.money_trace_runner import start_money_trace, stop_money_trace
-from .infra.db import background_session_maker, verify_db
+from .infra.db import ReportBusy, background_session_maker, verify_db
 from .infra.catalog_observations import (
     CachedEndpointObservationReader,
     PostgresEndpointObservationReader,
@@ -46,8 +45,6 @@ from .routers import call as call_routes
 AppRole = Literal["all", "dataplane", "control"]
 RouteKey = tuple[str, tuple[str, ...], str]
 
-# Every HTTP route has one workload owner. A new decorator in api.py fails app creation until its
-# key is placed here, so the dataplane cannot silently acquire a management or runner endpoint.
 _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/enrich-arena', ('GET',), 'enrich_arena_page'),
     ('/web-arena', ('GET',), 'web_arena_page'),
@@ -142,6 +139,11 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/auth/cli/approve', ('POST',), 'auth_cli_approve'),
     ('/login', ('GET',), 'login_page'),
     ('/auth/me', ('GET',), 'auth_me'),
+    ('/auth/sso/callback', ('GET',), 'sso_callback'),
+    ('/auth/sso/discover', ('POST',), 'sso_discover'),
+    ('/auth/sso/idp/start', ('GET',), 'sso_idp_start'),
+    ('/auth/sso/workos/webhook', ('POST',), 'sso_workos_webhook'),
+    ('/auth/sso/{org_slug}/start', ('GET',), 'sso_start'),
     ('/auth/logout', ('POST',), 'auth_logout'),
     ('/auth/email/start', ('POST',), 'auth_email_start'),
     ('/auth/email/verify', ('POST',), 'auth_email_verify'),
@@ -188,6 +190,7 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/resources', ('GET',), 'resources_page'),
     ('/blog', ('GET',), 'blog_index'),
     ('/blog/people-search-bench', ('GET',), 'blog_people_search_bench'),
+    ('/blog/security-incident-2026-10-23', ('GET',), 'blog_security_incident_2026_10_23'),
     ('/blog/work-email-finding-bench', ('GET',), 'blog_work_email_finding_bench'),
     ('/grokbot', ('GET',), 'grokbot_page'),
     ('/fable', ('GET',), 'fable_page'),
@@ -215,6 +218,8 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/admin/showcase/apps/{app_id}', ('PATCH',), 'staff_edit'),
     ('/admin/showcase/teams/{org_id}/apps', ('POST',), 'staff_create'),
     ('/admin/showcase/teams/{org_id}', ('GET',), 'staff_team'),
+    ('/rankings', ('GET',), 'rankings_page'),
+    ('/rankings/data/{board}', ('GET',), 'rankings_board'),
     ('/admin/images/{kind}', ('POST',), 'staff_upload'),
     ('/admin/images/staging/{key:path}', ('GET',), 'staff_staged_image'),
     ('/images/{kind}', ('POST',), 'upload_image'),
@@ -266,13 +271,7 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/onboard/demo', ('POST',), 'onboard_demo'),
     ('/onboard/skip', ('POST',), 'onboard_skip'),
     ('/onboard/reset', ('POST',), 'onboard_reset'),
-    ('/onboarding/start', ('POST',), 'onboarding_start'),
-    ('/onboarding', ('GET',), 'onboarding_view'),
-    ('/onboarding/answer', ('POST',), 'onboarding_answer'),
-    ('/onboarding/preview', ('POST',), 'onboarding_preview_start'),
-    ('/onboarding/preview/{preview_id}', ('GET',), 'onboarding_preview_view'),
-    ('/onboarding/preview/{preview_id}/answer', ('POST',), 'onboarding_preview_answer'),
-    ('/onboarding/preview/{preview_id}/call', ('POST',), 'onboarding_preview_call'),
+    ('/onboard/team', ('POST',), 'onboard_team'),
     ('/demo/sandbox', ('POST',), 'demo_sandbox_mint'),
     ('/demo/sandbox/live', ('GET',), 'demo_sandbox_live'),
     ('/stripe/webhook', ('POST',), 'stripe_webhook'),
@@ -305,6 +304,14 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/referrals', ('GET',), 'my_referrals'),
     ('/referrals/code', ('POST',), 'mint_referral_code'),
     ('/billing/stripe/webhook', ('POST',), 'billing_stripe_webhook'),
+    ('/orgs/{org_id}/sso', ('GET',), 'sso_status'),
+    ('/orgs/{org_id}/sso/blocked', ('GET',), 'sso_blocked_members'),
+    ('/orgs/{org_id}/sso/blocked/{user_id}/restore', ('POST',), 'sso_restore_member'),
+    ('/orgs/{org_id}/sso/checkout', ('POST',), 'sso_checkout'),
+    ('/orgs/{org_id}/sso/cancel', ('POST',), 'sso_cancel'),
+    ('/orgs/{org_id}/sso/enforce', ('POST',), 'sso_enforce'),
+    ('/orgs/{org_id}/sso/invite-it', ('POST',), 'sso_invite_it'),
+    ('/orgs/{org_id}/sso/setup/{intent}', ('POST',), 'sso_setup'),
     ('/orgs/{org_id}/members/{user_id}/cap', ('PATCH',), 'set_member_cap'),
     ('/orgs/{org_id}/members/{user_id}/access', ('PATCH',), 'set_member_access'),
     ('/usage/me', ('GET',), 'my_usage'),
@@ -389,6 +396,7 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/admin/hub/updates', ('GET',), 'admin_hub_updates'),
     ('/admin/hub/updates/{tool_id}', ('POST',), 'admin_hub_update_decide'),
     ('/admin/calls', ('GET',), 'admin_calls'),
+    ('/admin/shadow', ('GET',), 'admin_shadow'),
     ('/admin/share', ('GET',), 'admin_share'),
     ('/admin/daily', ('GET',), 'admin_daily'),
     ('/admin/errors', ('GET',), 'admin_errors'),
@@ -427,10 +435,8 @@ _DATAPLANE_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
 })
 
 ROLE_BACKGROUND_TASKS: dict[AppRole, tuple[str, ...]] = {
-    # Arena statistics moved out of the web processes: `treg-worker arena insights` (a cron)
-    # walks `callrecord` on its own schedule, so web processes no longer compete for the cursor
-    # row and a deploy no longer multiplies that scan. Only `/arena/insights` (a
-    # snapshot read) stays here.
+    # Arena statistics are built by `treg-worker arena insights` (a cron) walking `callrecord`, so
+    # web processes never compete for its cursor row. Only `/arena/insights` (a snapshot read) is here.
     "all": ("treg.adsconv.worker",),
     "dataplane": (),
     "control": ("treg.adsconv.worker",),
@@ -456,7 +462,7 @@ _STATIC_ANCHOR = ("/auth/cli-token", ("GET",), "auth_cli_token")
 
 try:
     from . import mcp as _mcp
-except Exception:  # pragma: no cover - exercised by deploys without the optional dependency
+except ImportError:
     _mcp = None
 
 
@@ -677,7 +683,7 @@ async def pool_gauge(*, sample_s: float = _POOL_GAUGE_SAMPLE_S,
                 peaks, samples, opened = {}, 0, time.monotonic()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - a gauge must never take the service down
+        except Exception:
             logging.getLogger("treg").exception("db pool gauge pass failed")
         await asyncio.sleep(sample_s)
 
@@ -793,11 +799,9 @@ def _lifespan(role: AppRole):
                         _mcp.clear_endpoint_observation_reader(endpoint_observations)
                     routed_call.clear_endpoint_observation_reader(endpoint_observations)
                     await arena.shutdown()
-                    await first_run.shutdown()
                     await endpoint_observations.aclose()
                     # analytics LAST: it is the sink the other two report their losses into, and a
-                    # drop during their drain is the one most worth hearing about. Draining it first
-                    # left those events queued behind a cancelled flusher.
+                    # drop during their drain is the one most worth hearing about.
                     await audit.drain()
                     await archive.drain()
                     await call_events.drain()
@@ -856,6 +860,7 @@ def create_app(role: AppRole = "all", *, archive_object_store=None) -> FastAPI:
     app.add_exception_handler(OverflowError, api_module._id_out_of_range)
     bootstrap_handlers._stamp_call_exit = call_routes._stamp_call_exit
     app.add_exception_handler(PoolTimeoutError, bootstrap_handlers._pool_saturated)
+    app.add_exception_handler(ReportBusy, bootstrap_handlers._report_busy)
     app.add_exception_handler(StarletteHTTPException, bootstrap_handlers._mark_treg_own_errors)
 
     _include_role_routes(app, api_module, role)

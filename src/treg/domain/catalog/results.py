@@ -100,7 +100,9 @@ def _expect_failure(endpoint_id: str, doc: object) -> str | None:
         return None
     path = str(rule["json_path"])
     actual = _dotted(doc, path)
-    if actual == rule.get("equals"):
+    # `misses` lists the values that mean "looked, found nothing": an answer for the adapter to
+    # judge, not a failure that leaves the hit verdict undecided.
+    if actual == rule.get("equals") or actual in (rule.get("misses") or ()):
         return None
     return f"{path}={json.dumps(actual, ensure_ascii=True, default=str)[:80]}"
 
@@ -166,7 +168,7 @@ def classify(endpoint_id: str, status: int, body: bytes) -> Result:
             return Result("unknown", "invalid_shape")
         try:
             miss = load().adapters[endpoint_id].is_miss(doc)
-        except Exception:  # a predicate failure is not evidence of a business change
+        except Exception:  # noqa: BLE001 - a predicate failure is not evidence of a business change
             return Result("unknown", "predicate_error")
         return Result("empty", "adapter_miss") if miss else Result("found", "adapter_hit")
     if endpoint_id == "leadsforge.people.email.find":

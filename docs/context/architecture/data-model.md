@@ -59,6 +59,16 @@ sources:
   - src/treg/alembic/versions/0073_org_flow_control_version.py
   - tests/test_org_flow_control_schema.py
   - src/treg/alembic/versions/0075_ad_click_stash.py
+  - src/treg/alembic/versions/0079_enterprise_sso.py
+  - src/treg/alembic/versions/0082_oauth_sso_provenance.py
+  - src/treg/alembic/versions/0083_enterprise_sso_safety.py
+  - src/treg/alembic/versions/0084_enterprise_workos_cleanup.py
+  - src/treg/alembic/versions/0085_enterprise_sso_blocks.py
+  - src/treg/alembic/versions/0087_rankings_snapshot.py
+  - src/treg/alembic/versions/0088_call_usage_rollup.py
+  - src/treg/application/call_usage_rollup.py
+  - src/treg/application/call_usage.py
+  - tests/test_call_usage_rollup.py
   - src/treg/timeutil.py
   - src/treg/infra/db.py
   - src/treg/infra/money_timing.py
@@ -96,6 +106,20 @@ related:
 Revision `0077` adds the empty `TeamDatabase` and `TableDoc` control-plane tables for
 [Workbench table storage](workbench-storage.md#management-metadata). It does not provision remote
 databases or business rows. Existing tables and data are unchanged by the migration.
+
+Migration `0079` adds `EnterpriseSSO` for a team's plan, subscription state, WorkOS organization,
+connection and directory; `EnterpriseSSOIdentity` for a stable team-specific SSO profile link;
+`EnterpriseDirectoryUser` for the directory roster, including users who have never signed in;
+and `EnterpriseSSOEvent` for WorkOS webhook deduplication. Team deletion removes the team-scoped
+rows before its `Org`, and active subscriptions block team deletion until canceled.
+Migration `0083` records whether SSO created a membership, makes an IdP subject unique within
+its team, reserves one pending enterprise Checkout per team, and marks keys issued under SSO
+enforcement. Existing keys have no SSO issuance proof and cannot enter an enforced team.
+Migration `0084` records when WorkOS cleanup completes. That marker keeps cancellation retries
+idempotent and prevents a new checkout while billable WorkOS resources may remain.
+Migration `0085` backfills and stores manual removal decisions separately from identity rows in minimal
+`EnterpriseSSOBlock` rows. Those rows survive connection cleanup, but leave with the team or
+the erased user; they contain no email or WorkOS identifiers.
 
 Migration `0043` adds `ProviderResource`, the durable organization-owned counterpart to the existing
 async ownership rows. It stores provider, resource kind, upstream id, display name, creator, source
@@ -190,11 +214,6 @@ An application rollback leaves the table in place; a schema downgrade deletes it
 
 ## Registry tables
 
-- **`OnboardingProfile`** - one new user's first-run lookup: `user_id` (unique, no FK, like
-  `ArenaRun`), the team it made, `status` (pending | running | done | failed), an encrypted payload
-  (setup rows, evidence, ranked tasks, filled inputs) and what the lookup cost the house team.
-  Revision `0062`; `application.onboard.first_run` is the only writer. See
-  [onboarding](../interface/onboarding.md#the-first-run-flow-onboarding_v2).
 - **`Feedback`** - durable team-scoped problem reports and suggestions. Contains the submitted
   category/message/references, authenticated org and user attribution, and the references verified
   against that team's call records or ledger. Revision `0025`; `domain.feedback` owns inserts;
@@ -230,9 +249,6 @@ uses this metadata, never the encrypted token's shape.
   FIRST page, first touch wins, 90 days), persisted once at signup in both doors. This is the column
   set that answers "how many teams did campaign X bring" - the `ad_*` columns only know Google
   clicks. `utm_referrer` is the referring hostname, kept even when no `utm_*` tag was present.
-  The first page itself is a separate first-touch cookie, `treg_landing` (path only, set on every
-  first visit, utm or not); it is ranking evidence for the first-run onboarding and is not stored
-  on the team.
   **`first_call_at`** (same migration as `ad_*`) -
   set once by a guarded UPDATE in the `/call/` handler,
   deliberately NOT derived from `CallRecord` (which `audit.py` sheds under load, undercounting exactly
@@ -252,7 +268,7 @@ uses this metadata, never the encrypted token's shape.
   pair.** `ROLE_RANK` orders the roles.
 - **`ApiKey`** — a credential control row. It keeps `org_id`, nullable `membership_id`, the retained
   identity label, kind, name, safe prefix, optional unique SHA-256 hash, state, `default_generation`, lifecycle times,
-  creator, and replacement id. A human membership has one `default_human` row for signed identity
+  creator, replacement id, and optional SSO issuance team. A human membership has one `default_human` row for signed identity
   keys and can have many `additional_human` rows. A scoped agent has one current `agent` row.
   `legacy_human` rows keep old stored membership tokens working during the compatibility release;
   new human memberships leave the old token-hash field empty and do not create legacy rows.
@@ -378,6 +394,28 @@ uses this metadata, never the encrypted token's shape.
   `recounted_on`). `application/key_spend_rollup.py`, run as `treg-worker spend rollup`, is the
   only writer of both, and the Team and Usage pages read only them; see [money](money.md) § Spend
   per API key. Team deletion clears a team's rows.
+
+  **Call counts per member are folded too.** The Usage page's counts and the observed-agents
+  roster grouped a team's whole 30-day window of `callrecord` per page open; the
+  `(org_id, created_at)` index finds the window, but every row is a heap fetch of a wide audit
+  row, and a busy team's report outlasted the report session's statement timeout. A covering
+  index was rejected: it would copy four string columns of every audit row and slow every audit
+  insert. Revision 0088 adds `CallUsageDay` (team + UTC day + member + kind + tool + client ->
+  `calls`, `last_at`) and the single-row `CallUsageCursor` (`cursor_id`, the last folded
+  `CallRecord.id`; `history_from`; `caught_up_at`). `application/call_usage_rollup.py`, run as
+  `treg-worker usage rollup`, is the only writer of both: it walks `callrecord` by primary key with
+  the commit lag of `catalog_stats`, starting at the first row of a 31-day history, and moves the
+  counts and the cursor in one transaction. The cursor lock is a no-op UPDATE, which also locks on
+  SQLite, where SELECT FOR UPDATE is ignored. A new cursor deletes the old day rows in the
+  transaction that creates it, so a rebuild never adds to a previous history. There is no recount: audit is lossy by design, and the
+  only race left undercounts by a row the queue could have shed anyway. A report
+  (`application/call_usage.py`) reads the folded rows and the team's rows after `cursor_id` in ONE
+  statement, so both halves share a snapshot and no row is counted twice or missed; the tail is
+  found over `(org_id, id)` and is a few minutes of calls while the cron runs. With no cursor row
+  (the worker never ran, e.g. a small self-hosted registry) the reports still aggregate
+  `callrecord` live; with a cursor that has not caught up they say usage is being prepared, and a
+  window older than `history_from` starts there and says so. `RunRecord` is still read live: it no
+  longer grows. Team deletion clears a team's rows.
 
   **`ix_callrecord_call_ref`, and why a database could lack it.** The model and revision 0001
   declare it, so every database Alembic created has it. A database that predates Alembic got
@@ -708,7 +746,9 @@ database path. A reserve acquisition timeout instead records `rejected=1` in mod
 cleanup remains a cancellation, not a rejection or fallback. `reserve_admission` also emits one
 best-effort `money_admission_rejected` WARNING per refusal with the numeric `org_id`, operation,
 reason and jittered `retry_after_s`; org IDs remain out of aggregate dimensions. Release and
-settlement timeouts still record mode `fallback`. A Redis lease serializes admitted same-org
+settlement record mode `fallback` with `fallback_wait_timeout` only when their wider budget
+(twice the lease, at most half the hold grace) expires; a settlement that waited past the reserve budget and then got the lease
+records mode `redis`, its whole wait in `wait_*`. A Redis lease serializes admitted same-org
 balance work; reserve timeout rejection keeps those expired waiters out of the funds transaction.
 
 `money_admission_reporting.emit_snapshot` writes one local JSON record and queues one PostHog event
@@ -1006,6 +1046,14 @@ length-capped click fields, and `created_at`/`updated_at` use naive UTC. Authent
 submit observations of proven emails; cookie-less signup uses observations from the last 90 days.
 Signup deletes the row once its team holds the click, and `treg-worker admin purge-ad-clicks`
 deletes rows past 90 days. No analytics or audit emission is involved. See [ads conversions](ads-conversions.md).
+
+## Rankings
+
+Additive revision `0087`: `rankingssnapshot`, one row (`id = "current"`) holding every /rankings
+board as JSON, the newest complete UTC day it covers (`through`) and when it was built. Written only
+by `application.rankings.refresh` (the `treg-worker rankings refresh` cron), which replaces the row
+whole; the page reads it. It holds counts, rates and durations per tool and endpoint, never a team,
+a key or money, so team deletion has nothing to remove. See [catalog](catalog.md).
 
 ## Showcase leaderboard and pictures
 

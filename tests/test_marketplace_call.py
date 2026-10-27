@@ -855,6 +855,44 @@ def test_hunter_domain_search_estimate_uses_credit_rounding():
     assert est_100 == 10 * credit_micro, f"limit=100 should reserve 10 credits: {est_100}"
 
 
+@pytest.mark.parametrize(("body", "credits"), [
+    ({"query": "fintech companies in San Francisco", "pageSize": 5}, 7),
+    ({"query": "fintech companies in San Francisco", "pageSize": 5, "pageToken": None}, 7),
+    ({"query": "fintech companies in San Francisco", "pageSize": 5, "pageToken": ""}, 7),
+    ({"query": "fintech companies in San Francisco", "pageSize": 5, "pageToken": "   "}, 7),
+    ({"pageSize": 5, "pageToken": 0}, 7),
+    ({"pageToken": "tok", "pageSize": 5}, 5),
+    ({"pageToken": " tok ", "pageSize": 5}, 5),
+])
+def test_fiber_ai_natural_language_first_page_reserves_interpretation(body, credits):
+    """A first page holds pageSize credits plus the 2-credit NL fee; a pageToken page does not.
+
+    pageToken counts only as a non-empty string. Raw micro-USD, before margin: one fiber-ai
+    credit is $0.02, so pageSize 5 is 100_000 and a first page is 140_000.
+    """
+    cat = catalog_store.load()
+    endpoint_id = "fiber-ai.people.search.natural_language"
+    cost = cat.cost_view(cat.by_id[endpoint_id]["cost"], "fiber-ai")
+    credit = call_resolution._usd_to_micro(cat.credit_rates["fiber-ai"])
+    assert credit == 20_000
+    estimate, unit = call_resolution._marketplace_pricing(
+        "fiber-ai", endpoint_id, cost, {}, json.dumps(body).encode(),
+    )
+    assert (estimate, unit) == (credits * credit, credit), body
+
+
+def test_fiber_ai_people_search_does_not_add_the_interpretation_fee():
+    """The +2 is only the natural-language run. A filtered people search stays pageSize credits."""
+    cat = catalog_store.load()
+    endpoint_id = "fiber-ai.people.search"
+    cost = cat.cost_view(cat.by_id[endpoint_id]["cost"], "fiber-ai")
+    credit = call_resolution._usd_to_micro(cat.credit_rates["fiber-ai"])
+    estimate, unit = call_resolution._marketplace_pricing(
+        "fiber-ai", endpoint_id, cost, {}, json.dumps({"pageSize": 5}).encode(),
+    )
+    assert (estimate, unit) == (5 * credit, credit)
+
+
 async def test_unmetered_call_keeps_the_callers_encoding(clients: AsyncClient):
     """Tier 2 (org's own key) still streams and must keep the relay contract: the caller's own
     compression choice travels upstream untouched."""
@@ -2262,11 +2300,11 @@ async def test_the_trial_allowance_bites_at_the_fx_number(clients: AsyncClient, 
     from treg.models import CallRecord
 
     async with session_maker() as db:
-        for i in range(50):
+        for _ in range(50):
             db.add(CallRecord(org_id=1, user_email="u@example.com", tool_name="finnhub.quote",
                               method="GET", path="/quote", status_code=200,
                               credential_tier="platform"))
-        for i in range(10):  # failures do not consume the allowance
+        for _ in range(10):  # failures do not consume the allowance
             db.add(CallRecord(org_id=1, user_email="u@example.com", tool_name="finnhub.quote",
                               method="GET", path="/quote", status_code=502))
         await db.commit()
@@ -2284,7 +2322,7 @@ async def test_failures_alone_never_exhaust_a_trial(clients: AsyncClient, trial_
     from treg.models import CallRecord
 
     async with session_maker() as db:
-        for i in range(60):
+        for _ in range(60):
             db.add(CallRecord(org_id=1, user_email="u@example.com", tool_name="finnhub.quote",
                               method="GET", path="/quote", status_code=429))
         await db.commit()
@@ -2317,7 +2355,7 @@ async def test_another_orgs_usage_never_burns_MY_trial(clients: AsyncClient, tri
     other = await clients.post("/orgs", json={"name": "another-trial-team"})
     assert other.status_code == 200, other.text
     async with session_maker() as db:
-        for i in range(50):
+        for _ in range(50):
             db.add(CallRecord(org_id=other.json()["org_id"], user_email="other@example.com",
                               tool_name="finnhub.quote", method="GET", path="/quote",
                               status_code=200, credential_tier="platform"))
@@ -2408,7 +2446,7 @@ def test_observed_cost_counts_brightdata_records():
     assert call_settle._observed_cost_micro(bd, b'{"status": "running", "message": "not ready"}') == 0
     # ndjson: one record per line
     assert call_settle._observed_cost_micro(bd, b'{"url": "a"}\n{"url": "b"}\n') == 3000
-    # csv: header + rows
+    # a csv body counts the rows under its header line
     assert call_settle._observed_cost_micro(bd, b"url,name\na,x\nb,y\n") == 3000
     # a payload the 8MB metered buffer truncated must settle at the estimate, never a partial count
     assert call_settle._observed_cost_micro(bd, b'[{"url": "a"}, {"url"') is None

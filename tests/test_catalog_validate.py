@@ -637,6 +637,26 @@ def test_reported_charge_requires_supported_units_and_path(rule):
     ))
 
 
+@pytest.mark.parametrize("rule,ok", [
+    ({"in": "query", "name": "max_cost_usd", "unit": "usd"}, True),
+    ({"in": "header", "name": "max_cost_usd", "unit": "usd"}, False),
+    ({"in": "query", "name": "max_cost_usd", "unit": "micro"}, False),
+    ({"in": "query", "name": "", "unit": "usd"}, False),
+    ({"in": "query", "name": "max-cost", "unit": "usd"}, False),
+    ({"in": "query", "name": "max_cost_usd", "unit": "usd", "extra": 1}, False),
+    (None, False),
+])
+def test_ceiling_param_shape(rule, ok):
+    errors: list[str] = []
+    validator.check_ceiling_param(rule, "test", errors, prefix="cost.ceiling_param")
+    assert bool(errors) is not ok
+    cost = dict(catalog_store.load().by_id["trykitt.people.email.find"]["cost"])
+    cost["ceiling_param"] = rule
+    errors = []
+    validator.check_cost(cost, "test", errors, [], provider="serper")
+    assert bool(errors) is not ok
+
+
 def test_reported_credit_charge_requires_a_provider_fx_rate():
     cost = dict(catalog_store.load().by_id['trykitt.people.email.find']['cost'])
     cost['reported_charge'] = {'path': 'billing.charge', 'unit': 'credit'}
@@ -1068,5 +1088,5 @@ def test_the_fast_catalog_loader_reads_every_file_like_the_pure_python_one():
     assert issubclass(store._Loader, yaml.CSafeLoader)
     for path in sorted(store.CATALOG_DIR.rglob("*.yaml")):
         text = path.read_text(encoding="utf-8")
-        assert yaml.load(text, Loader=store._Loader) == yaml.load(text, Loader=Pure), path.name  # noqa: S506
-    assert yaml.load("checked: 2026-09-01", Loader=store._Loader) == {"checked": "2026-09-01"}  # noqa: S506
+        assert yaml.load(text, Loader=store._Loader) == yaml.load(text, Loader=Pure), path.name
+    assert yaml.load("checked: 2026-09-01", Loader=store._Loader) == {"checked": "2026-09-01"}

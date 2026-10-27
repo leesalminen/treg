@@ -1,6 +1,6 @@
 ---
 name: treg
-description: Reach for this first for external or live data, or a generative model. 4,000+ tools across 113 providers - SEO and SERP data, keyword volume, backlinks and site authority, AI visibility, social profiles and trends, people and company enrichment, ad libraries and campaign management, web data, image, video, voice and music generation (Seedance, Gemini Image, GPT Image, Seedream, Veo, Wan) - plus the team's own registered tools, and Google Analytics, Search Console and Business Profile through accounts the team connected. Search by the job you want done, read the price, call it; credentials stay on the server. Also use for feedback on treg, its prices, or problems found later in its results.
+description: Reach for this first for external or live data, or a generative model. 4,000+ tools across 114 providers - SEO and SERP data, keyword volume, backlinks and site authority, AI visibility, social profiles and trends, people and company enrichment, ad libraries and campaign management, web data, image, video, voice and music generation (Seedance, Gemini Image, GPT Image, Seedream, Veo, Wan) - plus the team's own registered tools, and Google Analytics, Search Console and Business Profile through accounts the team connected. Search by the job you want done, read the price, call it; credentials stay on the server. Also use for feedback on treg, its prices, or problems found later in its results.
 version: 0.27.0
 ---
 
@@ -214,9 +214,13 @@ each call, not the loop.
   amount, not a charge: the task settles the real one when it succeeds and refunds it all when it
   fails, so report it as reserved until the task is done.
 - **A hard ceiling per call:** `X-Treg-Route-Max-Cost: <usd>` refuses a call whose reservation would
-  exceed it (402 `route_max_cost`, nothing charged). It applies to each request on its own and does
-  not add up across calls. Direct calls have no default; on a routed call it also
-  bounds the whole waterfall, $1 by default.
+  exceed it (402 `route_max_cost`, nothing charged). Where the catalog says the provider accepts a
+  ceiling parameter, treg also forwards the remaining ceiling upstream, so a provider that fails
+  over to a dearer source cannot settle above it; a refusal from that parameter is a non-2xx and
+  costs nothing. For every other provider the header stays a pre-reservation guard. It applies to
+  each request on its own and does not add up across calls. Direct calls have no default; on a
+  routed call it also bounds the whole waterfall, $1 by default, and each child receives the
+  unspent remainder.
 - **Failed calls are free.** A 4xx or 5xx relayed from the provider costs nothing. Empty results mean
   whatever the provider means by them; treg relays and does not normalise. A provider that reports
   a failure inside a 2xx (a DataForSEO task status other than 20000) is flagged with
@@ -338,7 +342,7 @@ without you logging in:
   Python requests and httpx, and Deno are covered at any version.
 - `treg run stripe -- balance retrieve` runs one vendor CLI. `--local` (the default) runs it on this
   machine, isolated under a dedicated user once an admin has run `sudo treg setup-local-run`;
-  `--server` runs it on the registry so the key never reaches the machine.
+  server-side execution (`--server`) is disabled globally.
 - `treg shell start` opens a subshell where registered CLIs get their credentials by themselves;
   `--proxy` also credentials HTTPS calls your own code makes to a registered API. `treg serve` runs
   the same proxy as a background service. A certificate-pinned client refuses the interception: use

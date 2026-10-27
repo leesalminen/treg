@@ -108,6 +108,9 @@ incl. duplicates, headers, cookies, body bytes):
    This is semantic JSON relay, not byte-faithful relay: formatting changes, non-ASCII text is
    emitted as UTF-8, and duplicate keys fail closed. Never use a JSON binding where the upstream
    signs or hashes the caller's raw body bytes.
+   On a connection to treg's own Meta app the credential includes an `appsecret_proof` query
+   parameter (HMAC of the injected token with the app secret) that replaces any caller value; see
+   auth-secrets.md for when one is owed.
 
    **Every JSON re-encode goes through `treg/jsontext.py`.** `json.loads` accepts an escaped lone
    UTF-16 surrogate (`"\ud835"`, a JavaScript scraper cutting a LinkedIn post mid-pair) and a plain
@@ -116,6 +119,11 @@ incl. duplicates, headers, cookies, body bytes):
    hub's child bodies and `treg --json call` relay the upstream's own escape. MCP is the one lossy
    surface: the SDK's pydantic serializer cannot write the escape, so `mcp._body` replaces each
    unpaired surrogate with U+FFFD (paired text is unchanged) rather than lose the paid answer.
+
+A catalog `ceiling_param` is appended by the call application onto `UpstreamRequest.query_items`
+before `relay()`, and only when the call carries a caller ceiling the caller did not already send
+under that name. `relay()` forwards that list verbatim. The pair is absent from the inbound query,
+so it does not enter `params_hash` or the archive key.
 
 > **What treg keeps from a call.** Successes retain no content: the relay forwards bytes and the audit
 > row records status, size and timing. A **failed relayed call** - platform, own-key, or plain own-tool
@@ -332,7 +340,8 @@ status and detail. Provider failures remain response data. Header contracts are 
 After credential refresh and relay, `_audit` records the attempt and mirrors it through
 `_tool_called_props` / `analytics.capture`. Provider identity is the catalog provider or the
 own tool's upstream host. Analytics includes outcome, status, timing, cost, call reference,
-capacity/cache/smoothing signals and user-agent attribution, never params or bodies.
+capacity/cache/smoothing signals and user-agent attribution (plus the MCP host for a call made
+through either MCP surface), never params or bodies.
 
 `domain.catalog.results.classify` shares verified hit/miss rules between business-hit telemetry
 and cache admission. Found means `hit=true`, explicit empty means false, and errors/unknown

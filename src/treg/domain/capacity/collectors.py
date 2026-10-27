@@ -171,8 +171,8 @@ async def _litescrape(c, key):
     if type(raw) is not int or raw < 0:
         raise ValueError("Litescrape status returned an invalid remaining_calls")
     limit = d.get("concurrency_limit")
-    note = (f"key concurrency limit {limit}" if type(limit) is int and limit > 0
-            else "key concurrency limit unavailable")
+    note = (f"concurrency limit {limit}" if type(limit) is int and limit > 0
+            else "concurrency limit unavailable")
     return {"value": raw, "unit": "calls", "note": note}
 
 
@@ -885,7 +885,7 @@ async def _brightdata(c, key):
     # GET /customer/balance returns account balance and pending charges (USD).
     # Requires billing permission on the API token — if the token lacks it, the request
     # returns 403 and the exception path surfaces the permission issue as a note.
-    # Response: {balance, credit, prepayment, pending_costs}
+    # The response carries balance, credit, prepayment and pending_costs.
     d = await _get(c, "https://api.brightdata.com/customer/balance",
                    headers={"Authorization": f"Bearer {key}"})
     return {"value": d.get("balance"), "unit": "USD",
@@ -916,7 +916,7 @@ async def _enrichlayer(c, key):
 
 async def _akta(c, key):
     # GET /mcp/account is free — returns plan tier and remaining credit balance.
-    # Response: {credit_balance, balance_amount, currency, package_type, is_enterprise, ...}
+    # The response carries credit_balance, balance_amount, currency, package_type, is_enterprise and more.
     d = await _get(c, "https://api.akta.pro/api/v1/mcp/account",
                    headers={"x-api-key": key})
     tier = d.get("package_type", "unknown")

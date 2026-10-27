@@ -39,11 +39,17 @@ Everything else in this file is guidance; these are the contract, and they win o
 3. A request holds zero database connections while upstream or object-storage I/O is in flight.
    Keep `reserve` and `settle` separate; read archive pointers, close the session, then fetch bytes.
 4. Plain `/call/` is a faithful relay: the injected credential (on treg's shared key, one of treg's
-   accounts for the provider, chosen per call and fixed for anything an account created), the
-   transport headers listed in
+   accounts for the provider, chosen per call and fixed for anything an account created; on a
+   connection to treg's own Meta app it also carries `appsecret_proof`, the HMAC of the injected
+   token with the app secret, replacing any caller value), the transport headers listed in
    `src/treg/infra/upstream/relay.py`, and (on treg's shared key only) the per-org and, for pinned
    agents, per-pin re-scoping of the caller's `Idempotency-Key` and treg's own `User-Agent` in place
-   of the caller's are the only rewrites. A credential
+   of the caller's are the only rewrites of what the caller sent. One addition is allowed: when the
+   catalog declares `ceiling_param` (`{in: query, name, unit: usd}` on the provider file or on that
+   endpoint's `cost`), the call carries a caller ceiling, and the caller did not already send that
+   query name, the call application appends `name=<remaining ceiling in USD>` to the outbound query
+   before `relay()`. An explicit caller value is never rewritten. The appended pair is absent from
+   the inbound query, so it does not enter `params_hash` or the archive key. A credential
    binding with `location: "json"` explicitly parses and reserializes the top-level JSON object; it
    is not byte-faithful and must never be used with an upstream that signs or hashes the raw body.
    Never add upstream-specific modeling.
@@ -171,8 +177,10 @@ agents then built against a constitution that was wrong.
 ### Security guards that look redundant on purpose
 
 `expose_dev_code` (dev OTP only on a local sqlite database, `config.py`), the call-time SSRF check
-(`infra/upstream/ssrf.py`), the fail-loud missing-Fernet-key check in `verify_db`, and the
-`treg run` allow-list and rlimits (`runner.py`). Read the fragment before touching any of them.
+(`infra/upstream/ssrf.py`), the fail-loud missing-Fernet-key check in `verify_db`, and
+the unconditional `POST /run` denial (`api.py`). Server-side CLI execution is disabled for every
+caller; an executable allow-list and rlimits are not an isolation boundary. Read the fragment before
+touching any of them.
 
 ## Development
 
@@ -182,6 +190,7 @@ uv run --frozen python -m pytest -q            # serial: debugging one test, or 
 uv run treg --help                             # the CLI from this checkout
 uv run python -m treg                          # the server
 uv run lint-imports                            # the import-linter contracts (CI runs this too)
+uv run ruff check                              # lint, config in pyproject.toml (CI runs this too)
 scripts/dev-local.sh up                        # live dev stack on :18790 with its own sqlite DB
 ```
 
@@ -208,9 +217,12 @@ so parallel runs and side-by-side runs never share one.
 
 ## Working agreement
 
-- Keep the suite green; add tests for new behavior. Conventional Commits (`feat(scope): ...`,
+- Keep the suite green. Conventional Commits (`feat(scope): ...`,
   `fix: ...`, `docs: ...`); one logical change per commit; the PR says what changed and why and
   names the fragments it updated.
+- **Comments only for external constraints and public contracts**: behavior a vendor, platform
+  or protocol forces on us, or a public API contract. History goes in the commit message, an
+  invariant goes in a test, design goes in `docs/context` (`.agents/skills/code-quality`).
 - `/mcp/` and `/mcp/v2/` differ on purpose. A change to either or to shared MCP code is reviewed
   against both; do not unify them in passing. `/mcp/v2/`'s tools and hidden platforms match the
   Claude directory submission: change them only with a resubmission. New features go to `/mcp/`.

@@ -2,6 +2,9 @@
 title: Endpoint catalog — what you can DO with a connected key, and which provider should do it
 status: shipped
 sources:
+  - src/treg/domain/catalog/rankings.py
+  - src/treg/application/rankings.py
+  - tests/test_rankings.py
   - scripts/catalog_added.py
   - scripts/catalog_backfill_added.py
   - .github/workflows/catalog-added.yml
@@ -60,6 +63,8 @@ sources:
   - src/treg/catalog/examples/linkup.web.answer.json
   - src/treg/catalog/examples/linkup.web.answer.status.json
   - src/treg/catalog/parallel.yaml
+  - src/treg/catalog/pdl.yaml
+  - src/treg/catalog/pdl.extended.yaml
   - src/treg/web/logos/parallel.svg
   - src/treg/catalog/examples/parallel.web.search.json
   - src/treg/catalog/examples/parallel.web.search.advanced.json
@@ -85,6 +90,7 @@ sources:
   - src/treg/catalog/examples/tinyfish.web.agent.run.cancel.json
   - tests/test_tinyfish.py
   - src/treg/catalog/exa.yaml
+  - src/treg/catalog/anyapi.yaml
   - src/treg/catalog/anyapi.extended.yaml
   - src/treg/catalog/adyntel.yaml
   - src/treg/catalog/examples/adyntel.meta-ads.library.advertiser.json
@@ -632,6 +638,7 @@ endpoints:
     expect:                          # optional; default is "HTTP 2xx"
       json_path: code                # dotted path into the response JSON
       equals: 200                    #   (for providers that answer HTTP 200 even on failure)
+      misses: [404]                  # optional; values meaning "found nothing": an answer, not a failure
     cost:
       type: per_success              # per_call | per_result | per_success | free | quota_rows
       value: 0.0015
@@ -1162,7 +1169,9 @@ that slice: it bills one whole credit (~$0.0245) for one email or ten (observed 
 `usd_per_call`. Settlement still reads `usd` and the derived email-count rule — display only.
 `Catalog.cost_view` reads the provider-neutral `cost.display` flags: `unit` names the shown unit,
 `grouped` shows the price for `cost.per` units, `round_up` labels a started block, `variable` adds
-a plus sign for selected additions, and `maximum` labels a validated reserve ceiling as "up to"
+a plus sign for selected additions, `value` shows the price of one `unit` when that is not the reserve
+unit (a job held at its full size but billed per page shows the page price; the hold still reads `usd`),
+and `maximum` labels a validated reserve ceiling as "up to"
 (it may wrap a price table, whose fallback is already the global upper bound). The result is
 display USD / unit / prefix / suffix fields only; `usd` and settlement are untouched. The validator
 checks the flags, requires a grouped price to declare a positive integer `per`, and refuses a table
@@ -1205,6 +1214,14 @@ ceiling. A finite nonnegative response value settles the call at that amount; a 
 body whose own `status` is 400 or more settles at zero; other missing, invalid, or non-finite
 evidence falls back to the normal estimate/miss rules. `reported_charge` is generic
 catalog metadata, not a provider-specific billing branch, and cannot be combined with `cost.settle`.
+
+A provider file, or one endpoint's `cost`, may declare `ceiling_param: {in: query, name, unit: usd}`.
+When the call has a caller ceiling and the caller did not send that query name, the call application
+appends it to the outbound query at the remaining ceiling in USD, so the provider refuses a dearer
+source instead of settling it. The validator requires `in: query`, `unit: usd` and an identifier
+`name`. The provider rule lives on `Catalog.ceiling_params`, not on `provider_meta` and not copied
+onto every cost, so catalog reads stay unchanged. A row-level `cost.ceiling_param` overrides it.
+The appended pair is outbound only: `params_hash` and the archive key stay the inbound query.
 
 `spooled_response: true` marks a synchronous endpoint whose answer inlines media too large for
 the 8 MiB settlement buffer (Gemini returns images as base64 in its JSON: ~9 MB at 2K, ~23 MB at
@@ -1768,6 +1785,8 @@ transaction under the cursor row's lock and re-reads every bucket it touches ins
 nothing about a bucket is carried between batches, so two overlapping runs (a slow backfill
 still going when the next schedule fires) serialize cleanly instead of one erasing the other's
 fold with the cursor already past the rows.
+The public `/rankings` page (`routers/rankings.py`) is the buckets' second reader, through a worker: `treg-worker rankings refresh` (`application/rankings.refresh`) builds every board and saves it as the one `rankingssnapshot` row, and the page and `/rankings/data/{board}` read only that row (kept five minutes per process), so no web process adds up the buckets. The refresh reads the counts of the last thirty complete days without the latency reservoirs (most of the table), then only the first 50 values of each reservoir of the last seven days (cut in Postgres with `jsonb_path_query_array`; a reservoir's prefix is still a uniform pick), closes the session, and `domain/catalog/rankings.py` builds the boards in memory: most used tools and endpoints by successful calls (7 and 30 days, the 7-day change against the week before), trending, each category's providers by share, most reliable tools (all of a tool's endpoints together: a 5xx is mostly the provider's own systems), fastest endpoints (speed depends on the job, so it stays per endpoint), top AI models (the generation platforms and decision models, filed as Image, Video, Audio or Decision: per model, keyed by the capability's model segment or else the model's name without its vendor, so one model at several vendors adds up, by type), and head to head: per job (one capability), the providers past the reliability floor side by side on success rate and median time, for the busiest jobs with at least two such providers. The last complete day is the day before both today and the cursor's `watermark`, so a stopped worker never shows a partial day. The usage boards (most used, most called, the chart, top by category) have no floor on purpose: they list every tool with calls, so a tool only one team uses shows that team's volume, never the team. The boards that rate or compare have floors (trending 1,000 successful calls this week, reliability 100 decided calls, speed 20 timed calls) so a small base cannot make a large percentage; `async` endpoints are left out of reliability and speed. It never reads `CallRecord`.
+
 Late terminal evidence uses a persistent correction queue, `EndpointStatDirty`, keyed by endpoint
 and original UTC submission day. `audit._write_batch` updates the actual matching `CallRecord`
 rows with `RETURNING`, then calls `catalog_stat_dirty.mark_dirty` in the same transaction. Repeated
@@ -2183,7 +2202,8 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   `/ N`, `==`/`!=` against literals, and named transforms (`split_first`, `split_last`, `join`,
   `has_type`, `len`, `list`, `obj`, `fmt`, `csv`, `lower`/`upper`, `at_least`, `at_most`, `null_if`, `choose`, `linkedin_handle`/
   `linkedin_url`, `email_domain`, `host`, `dfs_location`, `seranking_source`, `tca_filter`,
-  `e164_digits`, `starts_with`, `with_country_code`).
+  `e164_digits`, `starts_with`, `with_country_code`, `count_with`, `role_seniority`, `role_department`,
+  `scalar`).
   `values` reads rows from object-keyed or list responses; `get` applies dotted/indexed lookup
   to another expression result (for example, the first company in a domain-keyed response).
   These are generic helpers, not provider-specific rewrites.
@@ -2194,6 +2214,8 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   expresses an upper bound in catalog-priced units (for example, fixed-page billing). Both the
   public quote and call-time plan use it through `routing/plan.py::cost_at`; invalid unit values
   remain unpriced. It does not replace the child's normal reserve/settle rules.
+  Optional adapter `max` (`{limit: 8}`) names a filter the provider caps: `build_plan` drops that
+  child for a request above the cap (`needs limit <= 8`) instead of letting it answer less than was asked.
 - **Verified at load, or absent** — `routing/contracts.py::verify`: `in` must reproduce the
   endpoint's own `test_request` and `out` must fill every required core field from its
   `example_response` (an example that is itself a miss passes with the hit half unverified).
@@ -2213,7 +2235,8 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   carries the range. Never hand-written; not in any
   provider file.
   `catalog_get` on it returns the contract and the ranked **plan** (the quote) —
-  nothing is reserved.
+  nothing is reserved. A child the router would not call on treg's key (paused, not
+  `platform_eligible`, no key on this deployment) ranks after the rest with a `skipped` reason.
 - **Ranking** — `routing/plan.py`: own keys (tier 2) first at cost 0; then
   `expected_cost_per_hit = cost_at(request) × P(billed) / P(hit)` where `cost_at` prices *this*
   request at its requested size (per-result × limit, credit-with-minimum rounded up) and `P(hit)`

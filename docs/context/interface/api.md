@@ -345,8 +345,10 @@ with the names of the colliding usable tools and the explicit `/call/<name>/<pat
 `require_member()` reads the `X-Treg-Token` header, hashes it
 (`crypto.hash_token`), looks up the
 `Membership` by `token_hash`, and returns a `Caller` (`membership, user, org` + `org_id`/`email`/`role`);
-401 on missing/invalid. Every scoped endpoint depends on it **except** `POST /users` + `POST
-/invites/accept` (open, self-registering) and `GET /oauth/callback` (browser-hit, protected by `state`).
+401 on missing/invalid; that body keeps its `detail` and adds a top-level `hint` (sign in with
+`treg login`, or use a current key), because scripts and older CLIs print it verbatim. Every scoped
+endpoint depends on it **except** `POST /users` + `POST /invites/accept` (open, self-registering)
+and `GET /oauth/callback` (browser-hit, protected by `state`).
 Each successful identity dependency commits its read-only transaction before the handler runs, so an
 application use case can open its own session without waiting behind the request's pool slot. The
 dependency-cached session remains usable because every session maker sets `expire_on_commit=False`.
@@ -426,7 +428,8 @@ shared HTTP client. `/auth/logout` remains an HTTP-only cookie action.
   [multi-tenancy](../architecture/multi-tenancy.md).
 - **Agents (machine identities):** `create_agent` (`POST /orgs/{id}/agents`, admin+) mints/rotates a
   member token for a machine caller - its own `daily_call_cap`, `tool_access` and audit trail, with no
-  new table; `list_agents` (`GET`, never returns a token) and `revoke_agent` (`DELETE …/{user_id}`,
+  new table; `list_agents` (`GET`, never returns a token; each agent's `connected` is one indexed
+  existence check for any call in the org, never a scan of its history) and `revoke_agent` (`DELETE …/{user_id}`,
   which also sweeps the deny rules and idempotent replay cache owned by that agent before deleting its
   membership; the schema cascades that cache as a backstop). An agent token is refused by
   `require_identity` and can never be an owner. **Re-POSTing the same name ROTATES, and a field the
@@ -438,8 +441,9 @@ shared HTTP client. `/auth/logout` remains an HTTP-only cookie action.
   call, scoped to its live agent membership and org. An old key's history cannot confirm a new
   key after rotation; unknown, foreign, disabled, revoked, or removed agent keys return 404.
   `GET /orgs/{id}/agents/observed` (admin+) lists the agents **detected in member
-  traffic** - one row per (member, runtime) from `CallRecord.client`/`RunRecord.client` over 30 days,
-  excluding plain-terminal (`''`/`cli`) and machine-identity traffic; attribution, never a gate. See
+  traffic** - one row per (member, runtime) from `CallRecord.client`/`RunRecord.client` over 30 days
+  (calls from the same daily usage rollup, so the window starts at a UTC midnight; `[]` while its
+  first backfill runs), excluding plain-terminal (`''`/`cli`) and machine-identity traffic; attribution, never a gate. See
   [multi-tenancy](../architecture/multi-tenancy.md).
 - **Projects (a sub-scope inside the org):** `create_project` / `list_projects` /
   `delete_project` (`/orgs/{id}/projects`, admin+ to mutate) - deleting frees its tools to org-wide and
@@ -458,9 +462,14 @@ shared HTTP client. `/auth/logout` remains an HTTP-only cookie action.
 - **Usage metering + caps** (usage-metering v1, `docs/USAGE-METERING-PLAN.md`): `org_usage`
   (`GET /orgs/{id}/usage?days=`, admin+) rolls up `CallRecord` + `RunRecord` since the window start into
   **by-user** (with a `call`/`local_run`/`server_run` split), **by-tool**, **by-day**, and totals - pure
-  `GROUP BY`, **no request/response bodies** (they aren't stored). It reads the window's audit rows
-  twice, not once per section: one grouped pass answers member, kind and tool together, and the
-  per-day count is the second. `set_member_cap`
+  counts, **no request/response bodies** (they aren't stored). The call side reads the daily usage
+  rollup plus the rows after its cursor ([data-model](../architecture/data-model.md)); the answer
+  carries `ready` (false, with no counts, until the rollup's first backfill has caught up) and
+  `history_from`, the first day the rollup holds, which a longer window starts at. Where the
+  rollup worker has never run, the audit table is aggregated directly. This rollup, `/usage/by-tag` and `/agents/observed` run on the gated
+  report session ([deploy](../ops/deploy.md#dashboard-reports)): when its slots are full or a
+  statement passes its timeout they answer `429 {"report_busy": "busy" | "timeout"}` with
+  `Retry-After: 2`, never the call surface's `treg_saturated`. `set_member_cap`
   (`PATCH /orgs/{id}/members/{user}/cap`, admin+) sets `Membership.daily_call_cap` (`-1` = unlimited,
   rejects `< -1`). `my_usage` (`GET /usage/me`, any member) returns the caller's own `used_today` + `cap`.
   `list_members` also returns each member's `daily_call_cap` + `used_today`. **Enforcement:**
@@ -518,26 +527,16 @@ shared HTTP client. `/auth/logout` remains an HTTP-only cookie action.
   client then scrubs the injected value from the CLI's output (see [local-run](../architecture/local-run.md)).
   `report_local_run` (`POST /tools/{name}/run-report`) takes the client's verdict enum (never raw output);
   `credential_invalid` marks the injected secret(s) invalid via the health fields, skipping `param` kind.
-- **Server runs (`treg run --server`):** `POST /run` accepts `{tool, args, timeout_s}` and
-  executes the org-scoped tool's `Tool.cli` profile through `runner.run_tool`. Secrets enter a
-  scrubbed child environment, argv is an array, and the process gets its own temporary home.
-  A profile is server-runnable without local-run opt-in, but tool/project ACL, deny rules, member
-  usage caps, global/per-user concurrency limits and the executable allowlist still apply.
-  `runner.resolve_exec_bin` is shared by validation and execution; allowed commands come from
-  the catalog or `TREG_RUN_ALLOWED_BINS`. The sandbox cannot run commands.
+- **Server runs (`treg run --server`):** `POST /run` unconditionally returns 503 with
+  `Server-side CLI execution is disabled`. The handler has no body, authentication or database
+  dependencies and cannot reach the runner. This applies to every caller, including ordinary teams
+  and sandbox visitors; CLI profiles and `TREG_RUN_ALLOWED_BINS` cannot re-enable it. `_tool_view`
+  reports `server_runnable: false` for every tool. Scrubbed environments and resource limits are not
+  a filesystem/process isolation boundary.
 
-  The response is `{stdout, stderr, exit_code, timed_out}`; a nonzero child exit is a normal 200,
-  startup/configuration errors are 4xx, and exhausted run slots return 429. `RunRecord.bundle_name`
-  stores the tool name for compatibility. `GET /runs` merges server records with local grants,
-  tagged `where=server|local` and `s|l`-prefixed ids. Run settings are managed through
-  `Tool.cli`, not bundle runtime metadata. See [local-run](../architecture/local-run.md).
-  - **Resource-limit sandbox (`runner.py`, the DoS half of the server-run sandbox):** every server-run
-    child is spawned with POSIX rlimits via a `preexec_fn` (`_spawn_preexec`/`_rlimit_preexec`) - a
-    CPU-seconds cap, a max-file-size cap, and core dumps disabled (a core would spill the injected secret
-    to disk). Env-gated (`TREG_RUN_RLIMITS` on by default; `TREG_RUN_CPU_SECONDS`, `TREG_RUN_FSIZE_MB`),
-    a no-op where `resource` is unavailable. Deliberately **no** address-space or process-count cap - a
-    virtual-memory cap crashes Go CLIs (gh/stripe/doctl) and `RLIMIT_NPROC` is per-uid, shared with the
-    server. Full **filesystem/network** isolation needs a container deploy and is a planned follow-up.
+  `GET /runs` still merges historical server records with local grants, tagged `where=server|local`
+  and `s|l`-prefixed ids. `RunRecord.bundle_name` stores the tool name for compatibility. Local grants
+  and execution retain their existing authorization. See [local-run](../architecture/local-run.md).
 - **Meta:** `meta` (`GET /meta`, open) → `{public_url, github, google, app_version, treg_version,
   posthog_key/posthog_host, intercom_app_id, hub, referral, paused_providers}` for the dashboard.
   `paused_providers` is `{service: {display_name, message}}` for `TREG_PAUSED_PROVIDERS`, empty by default. `referral` carries the
@@ -561,7 +560,7 @@ shared HTTP client. `/auth/logout` remains an HTTP-only cookie action.
   | `GET /catalog/search?q=&limit=&added_within_days=&sort=&engine=` | Ranked endpoint views, count/total and hints; default 25, maximum 100. A query naming a provider with a task leads with that provider's rows, says so in `led_by`, and shows no `score`. `engine=agent` (the CLI's search) answers with the use case behind MCP `catalog_search` in this route's row shape, plus `engine`, the answer's `verdict`, `reason` and `jobs` where v2 answered (see [search-experiment](../architecture/search-experiment.md)). Listed hub tools merge into the same ranking by score (see [hub](../architecture/hub.md)); a hub row's run hint is its own `treg call <id> --data` line, since it has no catalog row or provider key. `added_within_days` (1-365, capped above with `capped_at_days`) and `sort=newest` list recently added tools, `q` optional; absent, the answer is unchanged apart from each row's `added` (see [catalog](../architecture/catalog.md)) |
   | `GET /catalog/find?q=` | Find tools for a described job: NDJSON stream of `candidates` then `judged` (verdict + kept rows with probabilities; a bare platform or provider name gets verdict `name` and its endpoints, unjudged; under `find_engine=v2` the recall is by job and the events add `units`, `reason`, `platform`, `engine`, and rows `fit_from` / `children_hidden`, see architecture/find.md); `&platform=<slug>` scopes recall and the keyword fallback (ranked among that shelf's rows, catalog-wide idf) and a bare provider name to that shelf (unknown slug is 404); rate limited per IP, 503 without a judge key |
   | `GET /catalog/providers/{service}` | Every tool one provider serves, by platform; a tool whose capability several providers serve on its platform carries `compare` (capability, URL key, provider count); reviewed endpoints carry `reviews`; unknown provider is 404 |
-  | `GET /catalog/endpoints/{id}` | Endpoint, provider, capability siblings (each with `observed` and, where reviewed, `reviews`), call template, inline example and next-step hints; `observed_pending: true` when the observation cache had not read some of these endpoints yet (ask again shortly); `overflow_price_usd` / `overflow_price_unit` / `overflow_via` on the endpoint when the deployment can relay it |
+  | `GET /catalog/endpoints/{id}` | Endpoint, provider, capability siblings (compact comparison rows: price, parameter names, `verified`, `observed` and, where reviewed, `reviews` without quotes), call template, inline example and next-step hints; `observed_pending: true` when the observation cache had not read some of these endpoints yet (ask again shortly); `overflow_price_usd` / `overflow_price_unit` / `overflow_via` on the endpoint when the deployment can relay it |
   | `GET /catalog/examples/{id}` | Captured JSON, resolved through the catalog before constructing a file path |
   | `POST /tool-requests` | Open, rate-limited demand report with capped fields and optional caller attribution |
 
@@ -652,8 +651,7 @@ shared HTTP client. `/auth/logout` remains an HTTP-only cookie action.
   permanent keys; missing `tv` means zero. New scoped credentials do not change those compatibility
   rules. `POST /auth/revoke-tokens` bumps the version and
   returns a replacement cookie/token for the caller. `/auth/logout` is a same-origin cookie action.
-  Onboarding routes are `POST /onboard/demo|skip|reset`, and behind `onboarding_v2`
-  `POST /onboarding/start` + `GET /onboarding` + `POST /onboarding/answer`; see [onboarding](onboarding.md).
+  Onboarding routes are `POST /onboard/demo|skip|reset|team`; see [onboarding](onboarding.md).
 
   The shared dependencies resolve a membership token, a team Default key, a legacy identity bearer
   plus `X-Treg-Org`, or a session cookie plus `X-Treg-Org`. Bootstrap credentials cannot access team
@@ -674,8 +672,7 @@ shared HTTP client. `/auth/logout` remains an HTTP-only cookie action.
   `sitetrack_js` (`GET /sitetrack.js`, no-cache) serves `web/sitetrack.js` with `{POSTHOG_KEY}` /
   `{POSTHOG_HOST}` templated from settings: the always-on first-party `treg_utm` first-touch cookie
   (utm_* + referring host, read by `_utm_attribution_from` / `_stamp_utm` in BOTH signup doors, `/users`
-  and `/orgs`), the first-touch `treg_landing` path cookie (read by the first-run onboarding as
-  ranking evidence) plus the PostHog bootstrap with pageviews ON. Loaded by every public page - landing,
+  and `/orgs`) plus the PostHog bootstrap with pageviews ON. Loaded by every public page - landing,
   use-case pages, resources, tutorial, and the SPA - so analytics sees the visitor's first hop rather
   than the post-OAuth `/app` landing. Without a key the analytics half is inert (empty string).
   `adtrack_js` (`GET /adtrack.js`, no-cache) serves the first-party ad-click capture script loaded by
@@ -720,8 +717,10 @@ shared HTTP client. `/auth/logout` remains an HTTP-only cookie action.
   "List as vendor" modal hands vendors a prompt naming this URL; the repo-side counterpart is
   `docs/VENDORS.md`).
   Browser-facing auth pages (GitHub callback, OAuth-connect result) render via `_auth_page` (brand card).
-- **Landing sandbox + hosted skills:** `demo_sandbox_mint` (`POST /demo/sandbox`, open, per-IP
-  rate-limited) mints an anonymous throwaway team (its response now carries `live` = whether the seeded
+- **Landing sandbox + hosted skills:** the landing sandbox is **closed**: `POST /demo/sandbox`
+  returns 410 and authentication refuses every sandbox visitor token with 403
+  ([landing-sandbox](landing-sandbox.md)); the rest of this entry describes the unreachable code
+  awaiting removal. `demo_sandbox_mint` (`POST /demo/sandbox`, open, per-IP rate-limited) minted an anonymous throwaway team (its response now carries `live` = whether the seeded
   stripe tool is a real wire); `demo_sandbox_skill` (`GET /demo/sandbox/skill`) exports what the visitor
   built. `skill_samples` (`GET /skills/samples`, open) + `skill_install`
   (`GET /skills/{name}/install.sh?token=`) host sample skills. `call_tool` short-circuits **sandbox**
@@ -1044,7 +1043,7 @@ The response has no id because Starlette owns it, but treg records the row and o
 `tool_called` event before re-raising. Failures before `execute_call`, plus body-stream failures after
 the handler returns its `StreamingResponse`, are not covered by that compensation path.
 
-A direct metered `/call/` honours **`X-Treg-Route-Max-Cost: <usd>`** as a hard per-call ceiling
+A direct metered `/call/` honours **`X-Treg-Route-Max-Cost: <usd>`** as a per-call ceiling
 (`service._set_caller_max_cost` and `reserve._platform_reserve`): when the reserve with margin would exceed it the
 call is refused **402** `error: route_max_cost` (`max_cost_micro`, `estimated_cost_micro`, no charge,
 audited `refused_by=balance` like every 402) — the same header and body shape the routed path uses,
@@ -1052,7 +1051,12 @@ so one agent-side handler covers both. Unlike `/do/` there is NO default on a di
 who named the endpoint and page size is uncapped unless they send the header. A non-numeric value is
 a 400. Routed children receive the unspent part of the route ceiling, including the default ceiling;
 this same reservation check also applies to overflow at its own price. Refusing a child cannot
-undo earlier paid attempts. Asked for by a customer whose runner approved $0.23 and was billed $0.56 (2026-09-04).
+undo earlier paid attempts. Where the catalog declares `ceiling_param`, treg also forwards the
+largest provider charge that still settles within the remaining ceiling after platform margin
+(the ceiling itself when the margin is 0), and never replaces a value the caller already sent,
+so settlement on a provider that reports its own charge cannot exceed the ceiling. The
+provider's refusal is a non-2xx and is not charged. For every other provider the header remains a
+pre-reservation guard. Asked for by a customer whose runner approved $0.23 and was billed $0.56 (2026-09-04).
 
 Metered responses also carry `X-Treg-Cost-Micro`; a reserved call that fails before a provider answer
 carries an explicit `0`. That `0` is what the call ends up costing, but the **balance can lag it**:
@@ -1122,6 +1126,14 @@ make a team. A failed grant recovers by rolling the session back, which expires 
 tracks - so both doors read their response fields *before* granting, and the redemption revives an
 expired `user`/`org` with `db.refresh` before touching them. The recovery path costs the team its
 credit, never the signup response or the referral attribution.
+
+## Payment history
+
+`GET /billing/history` serves the team's unified payment history. Its `kind` filter accepts
+`all`, `manual`, `auto`, or `subscription`; `cursor` pages newest first. Top-up amounts come from
+credited ledger entries, while SSO amounts and invoice documents come from Stripe. A paid SSO
+invoice includes a receipt URL only when Stripe has a successful Charge receipt for it. Stripe
+document failures do not remove ledger-backed top-up rows.
 
 ## Optional checkout attribution
 

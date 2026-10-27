@@ -23,7 +23,8 @@ Checks (the success criteria from docs/context/architecture/catalog.md):
     billing
   - every tool row carries `added:`, the UTC day it reached main, as YYYY-MM-DD and not in the
     future (scripts/catalog_added.py writes it; its `--base` mode guards existing dates in CI)
-  - a `verified` endpoint must have an existing example_response file
+  - a `verified` endpoint must have an existing example_response file, and every example file
+    parses and stays under EXAMPLE_MAX_BYTES
   - an extended endpoint a verification run has touched claims exactly one non-empty state
     (verified | unverified | untestable | skipped), and an `untestable` one carries no
     test_request for a re-verify run to call it with anyway
@@ -46,6 +47,7 @@ never what a claim on it is worth.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 import re
 import sys
@@ -61,6 +63,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from treg.domain.catalog.store import COST_SOURCES as _SOURCES  # noqa: E402
 from treg.domain.catalog.store import COST_UNITS as _UNITS  # noqa: E402
 from treg.domain.catalog.store import CONFIDENCES as _CONFIDENCES  # noqa: E402
+from treg.domain.catalog.store import EXAMPLE_MAX_BYTES  # noqa: E402
 from treg.domain.catalog.store import _effective_cost, effective_async_descriptor  # noqa: E402
 from treg.domain.catalog.routing import paths as _paths  # noqa: E402
 
@@ -75,12 +78,12 @@ COST_UNITS, CONFIDENCES, COST_SOURCES = set(_UNITS), set(_CONFIDENCES), set(_SOU
 # price is still the best number we have, and failing the build over the calendar would only teach
 # people to bump the date without re-checking.
 STALE_DAYS = 90
-# The one spelling of free. It was written three incompatible ways across 661 endpoints (`value: 0`,
-# `value: 0.0`, and no value at all), which made "is this free?" a per-entry judgement call and left
-# `cost.usd` null on a third of them — indistinguishable, downstream, from "price unknown".
+# The one spelling of free. Any other (`value: 0.0`, or no value at all) makes "is this free?" a
+# per-entry judgement call and leaves `cost.usd` null - indistinguishable, downstream, from
+# "price unknown".
 CANONICAL_FREE = {"value": 0, "currency": "USD", "unit": "call"}
 TIERS = {"core", "extended"}
-# what an endpoint IS (marketplace browse surface vs. plumbing). Optional — absent reads as "data" —
+# what an endpoint IS (catalog browse surface vs. plumbing). Optional - absent reads as "data" -
 # but a stated one must be from this set. See docs/context/architecture/catalog.md.
 KINDS = {"data", "action", "account", "utility"}
 ENDPOINT_STATUSES = {"retired", "broken"}
@@ -110,8 +113,7 @@ REQUIRED = {
 # The four outcomes an extended endpoint can have once a verification run has touched it. They are
 # mutually exclusive by construction, and an entry that has been through the pipeline must claim
 # exactly one — "no state" reads as "never attempted", which is a different fact and a lie once a
-# run has been over it. This caught a real regression: re-running an endpoint overwrote its result
-# record, dropped the reason string, and stamped an EMPTY state that nothing else noticed.
+# run has been over it.
 STATES = ("verified", "unverified", "untestable", "skipped")
 # a long token-looking literal anywhere in a catalog file is a leak until proven otherwise
 LEAK = re.compile(r"(Bearer\s+[A-Za-z0-9+/_=-]{16,}|[A-Za-z0-9+/]{40,}={0,2})")
@@ -159,6 +161,19 @@ def check_status_marker(ep: dict, where: str, endpoint_status: dict[str, str],
     elif endpoint_status[successor]:
         fail(errors, where, f"superseded_by target '{successor}' is itself "
                             f"{endpoint_status[successor]} — replacements must be live")
+
+
+def check_example_file(path: Path, where: str, errors: list[str]) -> None:
+    if not path.is_file():
+        return
+    size = path.stat().st_size
+    if size > EXAMPLE_MAX_BYTES:
+        fail(errors, where, f"example_response is {size} bytes, over {EXAMPLE_MAX_BYTES}; shrink it "
+                            f"the way catalog_verify.py --write does")
+    try:
+        json.loads(path.read_text())
+    except ValueError:
+        fail(errors, where, "example_response is not valid JSON")
 
 
 def _as_date(value) -> dt.date | None:
@@ -862,6 +877,21 @@ def _unit_rate(provider: str | None, unit: object) -> object:
     return entry.get("usd") if isinstance(entry, dict) else entry
 
 
+_CEILING_PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def check_ceiling_param(rule, where: str, errors: list[str], *, prefix: str) -> None:
+    """A caller ceiling forwarded upstream: query name, USD, and nothing else.
+
+    `in: header` is refused so a declaration the relay cannot honour is not silently ignored.
+    """
+    if (not isinstance(rule, dict) or set(rule) != {"in", "name", "unit"}
+            or rule.get("in") != "query" or rule.get("unit") != "usd"
+            or not isinstance(rule.get("name"), str)
+            or not _CEILING_PARAM_NAME.fullmatch(rule["name"])):
+        fail(errors, where, f"{prefix} must be {{in: query, name: <identifier>, unit: usd}}")
+
+
 def check_cost(cost: dict, where: str, errors: list[str], warnings: list[str],
                input_schema: object = None, provider: str | None = None) -> None:
     """The price block's own rules — the ones that make a figure BILLABLE rather than decorative.
@@ -896,6 +926,8 @@ def check_cost(cost: dict, where: str, errors: list[str], warnings: list[str],
                                 "fx.yaml credit_rates_usd entry")
         if "settle" in cost or cost.get("type") == "free":
             fail(errors, where, "cost.reported_charge requires a paid price without cost.settle")
+    if "ceiling_param" in cost:
+        check_ceiling_param(cost.get("ceiling_param"), where, errors, prefix="cost.ceiling_param")
     if "call_fee" in cost:
         fee = cost["call_fee"]
         if (provider != "apify" or cost.get("type") != "per_result"
@@ -913,12 +945,15 @@ def check_cost(cost: dict, where: str, errors: list[str], warnings: list[str],
         display = cost["display"]
         if (not isinstance(display, dict) or not isinstance(display.get("unit"), str)
                 or not display["unit"].strip() or len(display["unit"]) > 40
-                or set(display) - {"unit", "grouped", "round_up", "variable", "maximum"}):
-            fail(errors, where, "cost.display requires a short unit and optional grouped/round_up/variable/maximum flags")
+                or set(display) - {"unit", "grouped", "round_up", "variable", "maximum", "value"}):
+            fail(errors, where, "cost.display requires a short unit and optional grouped/round_up/variable/maximum flags and value")
         else:
             for flag in {"grouped", "round_up", "variable", "maximum"} & set(display):
                 if type(display[flag]) is not bool:
                     fail(errors, where, f"cost.display.{flag} must be boolean")
+            if "value" in display and (type(display["value"]) not in (int, float) or display["value"] <= 0
+                                       or display.get("grouped")):
+                fail(errors, where, "cost.display.value is a positive price of one unit, in the cost's currency, and not grouped")
             if display.get("round_up") and not display.get("grouped"):
                 fail(errors, where, "cost.display.round_up requires grouped")
             if display.get("grouped") and (type(cost.get("per")) is not int or cost["per"] <= 0):
@@ -1207,7 +1242,7 @@ def main(argv: list[str]) -> int:
     taxonomy = tax.get("capabilities") or {}
     capabilities = set(taxonomy)
 
-    from treg.oauth_providers import REGISTRY  # noqa: E402
+    from treg.oauth_providers import REGISTRY
 
     only = set(argv)
     all_files = sorted(p for p in CATALOG.glob("*.yaml")
@@ -1242,8 +1277,7 @@ def main(argv: list[str]) -> int:
     # (service, method, path) -> {tier: [ids]} — to catch the same operation shipping in BOTH tiers.
     # Some providers multiplex one URL across many jobs (SerpApi's `engine`, BrightData's
     # `dataset_id`, GAQL's query body), so a core/extended path collision is legitimate THERE and
-    # only there. Everywhere else it is the ingest-dedup failure that shipped 27 duplicate rows
-    # (dataforseo via the /v3 prefix mismatch, scrapecreators via core being curated after ingest).
+    # only there. Everywhere else it is an ingest-dedup failure.
     # Some APIs deliberately expose several catalog jobs on one method/path and select the job by
     # required parameters. Instagram Graph's profile read and business_discovery both call
     # GET /{ig_user_id}; the latter is selected by its required business_discovery `fields` value.
@@ -1268,6 +1302,8 @@ def main(argv: list[str]) -> int:
         need = "spec_urls" if extended_file else "docs"
         if not isinstance(src, dict) or not src.get(need):
             fail(errors, name, f"source.{need} missing")
+        if "ceiling_param" in data:
+            check_ceiling_param(data.get("ceiling_param"), name, errors, prefix="ceiling_param")
         proposed = set(data.get("proposed_capabilities") or {})
         known = capabilities | proposed
 
@@ -1406,6 +1442,8 @@ def main(argv: list[str]) -> int:
                 check_managed_resource(ep["managed_resource"], where, inp, errors)
             if "spooled_response" in ep:
                 check_spooled_response(ep, effective_async, where, errors)
+            if ep.get("example_response"):
+                check_example_file(CATALOG / str(ep["example_response"]), where, errors)
             if ep.get("verified"):
                 ex = ep.get("example_response")
                 if not ex:

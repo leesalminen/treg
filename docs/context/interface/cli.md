@@ -176,8 +176,10 @@ for a per-org token, and picks the org for an identity token). `_effective_org` 
 exits non-zero on HTTP >= 400, and on >= 400 first prints one stderr line (`_show_failure_diagnostics`,
 2026-09-05): the HTTP status, whose answer it is (`X-Treg-Error: 1` = treg refused; absent = the
 provider answered and treg relayed it unchanged), the `X-Treg-Call-Id` to quote to support, and the
-`X-Treg-Cost-Micro` charge when the header is present. stdout stays the exact body — a runner that
-saved only stdout filed 115 relayed Moz quota 403s as a bare "cli_error" with no status or id. A
+`X-Treg-Cost-Micro` charge when the header is present. When `TREG_TOKEN` is set, treg's own 401
+(never a relayed one) adds that the variable overrides `treg login` and needs a current key: the
+body's `hint` cannot know that. stdout stays the exact body — a runner that saved only stdout
+filed 115 relayed Moz quota 403s as a bare "cli_error" with no status or id. A
 metered 2xx gets the matching line (`_show_charge_line`: `treg: charged $0.006667 · call id …`,
 replay-aware), plus a provider-failure line for `X-Treg-Upstream-Failed` ([api](api.md)). `X-Treg-Capacity:
 exhausted` (treg's own account is out) replaces the failure line's "whose answer" with the shared
@@ -419,8 +421,7 @@ Bare **`treg connections`** now lists (the subparser is `required=False` with a 
     locally). `treg tool update <id> --local-run on|off` flips `cli.enabled`. **`--fs-jail`** (opt-in, macOS)
     confines the CLI's file writes to a private scratch (`fsjail.macos_profile` + `sandbox-exec`, forwarded
     via `TREG_RUN_FSJAIL`) so it can't drop the key in a member-readable file — see [local-run](../architecture/local-run.md).
-  - **`--server`** (Tier 0, `_run_server`) — run a runnable skill's CLI **on the registry server** (`POST
-    /run`, `--timeout` cap 600), secrets injected server-side, stdout/stderr + exit code streamed back.
+  - **`--server`** (`_run_server`) — sends `POST /run`, which is disabled globally and returns 503.
     **`cli runs`** (`cmd_runs`, `--limit`) shows the run audit log — now **BOTH tiers**: `GET /runs` merges
     server runs and local grants, each tagged `where` (`server`|`local`; a local success has a null exit
     code, since only failures report back).
@@ -428,7 +429,8 @@ Bare **`treg connections`** now lists (the subparser is `required=False` with a 
 - **`cli shell`** (`cmd_shell_start`/`cmd_shell_stop`) — **`cli shell start`** opens a subshell where the team's
   registered CLIs run with the credential injected transparently (a shim dir first on `PATH` routes each to
   `treg run`); **`cli shell stop`** (or `exit`) leaves. `--server-for a,b` routes named tools to the server
-  (key never on the machine, if `server_runnable`), `--ttl MIN` auto-closes. **`--proxy`** (opt-in, with
+  only when `server_runnable` is true; the server now reports false for all tools. `--ttl MIN`
+  auto-closes. **`--proxy`** (opt-in, with
   `--proxy-port` / `--renew-ca`) additionally catches HTTPS calls the AGENT makes on its own to a
   registered host — `_start_local_proxy` seeds the allow-list from the tool listing already fetched for
   the shims and hands `start_session` the environment + a stop callback. See [shell](shell.md) and

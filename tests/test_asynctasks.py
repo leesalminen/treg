@@ -16,7 +16,6 @@ from sqlmodel import select
 
 from treg.application import asynctasks as task_app
 
-_real_poll = task_app._poll
 from treg.application.call import service as call_service
 from treg.application.call.resolve import MarketplaceCall
 from treg.application.call.types import UpstreamResponse
@@ -32,6 +31,8 @@ from treg.models import (
     Tool,
 )
 from treg.timeutil import utcnow_naive
+
+_real_poll = task_app._poll
 
 
 EP = "replicate.image-gen.flux-schnell"
@@ -267,6 +268,42 @@ async def test_claim_wait_is_inside_processing_deadline(
         row = await db.get(AsyncTaskRecord, call_id)
         assert row.attempts == 0 and row.consecutive_failures == 0
         assert await db.get(Hold, call_id) is not None
+
+
+async def test_worker_admission_keeps_what_the_claim_and_poll_left_for_the_session(
+    clients: AsyncClient, monkeypatch, replicate_platform,
+):
+    from contextlib import asynccontextmanager
+
+    from treg.infra import money_admission
+
+    await _due_submission(clients, monkeypatch, {"status": "succeeded", "output": ["u"]})
+    monkeypatch.setattr(task_app, "PROCESS_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(task_app, "SETTLEMENT_SESSION_S", 0.5)
+    claim, poll = task_app._claim_due, task_app._poll
+
+    async def slow_claim(*args):
+        await asyncio.sleep(0.4)
+        return await claim(*args)
+
+    async def slow_poll(*args):
+        await asyncio.sleep(0.3)
+        return await poll(*args)
+
+    admit, waits = money_admission.admit, []
+
+    @asynccontextmanager
+    async def recording_admit(org_ids, *, operation, max_wait_s=None):
+        waits.append(max_wait_s)
+        async with admit(org_ids, operation=operation, max_wait_s=max_wait_s):
+            yield
+
+    monkeypatch.setattr(task_app, "_claim_due", slow_claim)
+    monkeypatch.setattr(task_app, "_poll", slow_poll)
+    monkeypatch.setattr(money_admission, "admit", recording_admit)
+    assert (await task_app.settle_due()).settled == 1
+    [wait] = waits
+    assert 0 < wait <= 2.0 - 0.4 - 0.3 - 0.5
 
 
 async def test_expired_worker_cannot_replace_new_claim_backoff(
@@ -1481,7 +1518,7 @@ async def test_cancellation_at_the_pending_row_commit_boundary_leaves_a_coherent
 
     monkeypatch.setattr(task_app, "defer_submission", defer_then_cancel)
     # The request path re-raises CancelledError after compensating; the ASGI client surfaces it.
-    with pytest.raises(BaseException):
+    with pytest.raises(asyncio.CancelledError):
         await _submit(clients, monkeypatch, {
             "id": "prediction-cancel", "urls": {"get": "https://api.replicate.com/v1/predictions/c"}})
     async with session_maker() as db:
